@@ -1,0 +1,9 @@
+# uv / Python
+.venv/
+__pycache__/
+*.pyc
+
+# Project runtime artifacts
+files.db
+export_output/
+pdf/
