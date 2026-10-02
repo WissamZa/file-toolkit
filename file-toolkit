@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Launch the File Toolkit from anywhere.
+#
+# The working folder (and database/output locations) come from
+# file_toolkit.conf — see the README — so this wrapper can be started
+# from any directory.
+set -e
+
+# Resolve the real script directory even when invoked through a symlink
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+    DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    case "$SOURCE" in
+        /*) ;;
+        *) SOURCE="$DIR/$SOURCE" ;;
+    esac
+done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+
+if command -v uv >/dev/null 2>&1; then
+    exec uv run --project "$SCRIPT_DIR" --quiet python "$SCRIPT_DIR/file_toolkit.py" "$@"
+elif [ -x "$SCRIPT_DIR/.venv/bin/python" ]; then
+    exec "$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/file_toolkit.py" "$@"
+else
+    echo "file-toolkit: 'uv' not found and no .venv in $SCRIPT_DIR." >&2
+    echo "Install uv (https://docs.astral.sh/uv/) and run 'uv sync' inside $SCRIPT_DIR." >&2
+    exit 1
+fi

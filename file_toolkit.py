@@ -6,6 +6,7 @@ import io
 import re
 import shutil
 import sqlite3
+import configparser
 from pathlib import Path
 
 from reportlab.pdfgen import canvas
@@ -13,20 +14,81 @@ from reportlab.lib.utils import ImageReader
 from pypdf import PdfReader, PdfWriter
 
 # --------------------------------------------------------------------------
-# Shared configuration
+# Shared configuration (file_toolkit.conf)
 # --------------------------------------------------------------------------
-DB_NAME = "files.db"
-TARGET_DIR = Path(".")            # directory scanned by the indexer
-EXPORT_OUTPUT_DIR = "./export_output"
-PDF_LINK_DIR = "pdf"
+CONFIG_FILE_NAME = "file_toolkit.conf"
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+DEFAULT_SETTINGS = {
+    "folder": ".",
+    "database": "files.db",
+    "export_output": "export_output",
+    "pdf_dir": "pdf",
+}
+
+
+def load_settings():
+    """Read settings from a config file if one exists — the current directory
+    first (local override), then next to the script — and resolve every path.
+    Relative values are anchored at `folder`; anything missing falls back to
+    the defaults above."""
+    settings = dict(DEFAULT_SETTINGS)
+    config_path = None
+    for candidate in (Path.cwd() / CONFIG_FILE_NAME, SCRIPT_DIR / CONFIG_FILE_NAME):
+        if candidate.is_file():
+            parser = configparser.ConfigParser()
+            try:
+                parser.read(candidate, encoding="utf-8")
+            except configparser.Error as e:
+                print(f"[Config] Ignoring malformed config file {candidate}: {e}")
+                continue
+            if parser.has_section("settings"):
+                for key, value in parser.items("settings"):
+                    if key in settings:
+                        settings[key] = value.strip()
+            config_path = candidate
+            break
+
+    folder = Path(settings["folder"]).expanduser()
+    if not folder.is_absolute():
+        folder = Path.cwd() / folder
+
+    def resolve(value):
+        path = Path(value).expanduser()
+        return path if path.is_absolute() else folder / path
+
+    return {
+        "folder": folder,
+        "database": str(resolve(settings["database"])),
+        "export_output": str(resolve(settings["export_output"])),
+        "pdf_dir": str(resolve(settings["pdf_dir"])),
+        "config_path": config_path,
+    }
+
+
+_SETTINGS = load_settings()
+TARGET_DIR = _SETTINGS["folder"]          # directory the toolkit operates on
+DB_NAME = _SETTINGS["database"]
+EXPORT_OUTPUT_DIR = _SETTINGS["export_output"]
+PDF_LINK_DIR = _SETTINGS["pdf_dir"]
+ACTIVE_CONFIG = _SETTINGS["config_path"]
+
+# Basenames of the toolkit's own output folders, never indexed or sorted
+OUTPUT_DIR_NAMES = {
+    os.path.basename(os.path.normpath(EXPORT_OUTPUT_DIR)),
+    os.path.basename(os.path.normpath(PDF_LINK_DIR)),
+}
 
 
 # ==========================================================================
 # 1) Day folder creation  (01-suffix ... 31-suffix)
 # ==========================================================================
 def create_day_folders():
-    month_input = input("Enter month (1-12): ").strip()
-    year_input = input("Enter year (e.g. 2026): ").strip()
+    month_input = ask("Enter month (1-12): ")
+    year_input = ask("Enter year (e.g. 2026): ")
+    if month_input is None or year_input is None:
+        print("  [Cancelled]\n")
+        return
 
     try:
         month = int(month_input)
@@ -88,7 +150,8 @@ def scan_and_index(db_path=DB_NAME, target_dir=TARGET_DIR):
     for root, _, files in os.walk(target_dir):
         folder = os.path.basename(root)
 
-        if folder.startswith('.') or root == '.':
+        if (folder.startswith('.') or folder in OUTPUT_DIR_NAMES
+                or Path(root) == Path(target_dir)):
             continue
 
         for file in files:
@@ -116,7 +179,13 @@ def export_files(db_path=DB_NAME, output_dir=EXPORT_OUTPUT_DIR):
     cursor = conn.cursor()
 
     cursor.execute(
-        "SELECT folder_name, filename, full_path FROM local_files WHERE filename='0.jpeg'"
+        """
+        SELECT folder_name, filename, full_path
+        FROM local_files
+        WHERE extension = '.jpeg'
+          AND (filename = '0.jpeg'
+               OR filename GLOB '[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9].jpeg')
+        """
     )
     rows = cursor.fetchall()
 
@@ -244,8 +313,7 @@ def build_folder_pdfs(db_path=DB_NAME):
 # 5) Hard-link compiled PDFs  (hardLink.py)
 # ==========================================================================
 def create_pdf_hardlinks(db_path=DB_NAME, target_link_dir=PDF_LINK_DIR):
-    root_dir = os.path.dirname(os.path.abspath(__file__))
-    pdf_target_dir = os.path.join(root_dir, target_link_dir)
+    pdf_target_dir = os.path.abspath(target_link_dir)
 
     if not os.path.exists(pdf_target_dir):
         os.makedirs(pdf_target_dir)
@@ -298,7 +366,129 @@ def create_pdf_hardlinks(db_path=DB_NAME, target_link_dir=PDF_LINK_DIR):
 
 
 # ==========================================================================
-# 6) One-click full pipeline: Index -> Build PDFs -> Hard link
+# 7) Sort files into month folders (by date in filename)
+# ==========================================================================
+# Matches a DD-MM-YYYY style date anywhere in a filename. Separators may be
+# '-', '.' or '_'; the lookarounds reject matches inside longer digit runs
+# (so '2026-08-01' or '01-08-12026' are never misread).
+DATE_IN_NAME_RE = re.compile(r"(?<!\d)(\d{2})[-._](\d{2})[-._](\d{4})(?!\d)")
+
+
+def extract_date_parts(filename):
+    """Return (day, month, year) from the first date in `filename`, or None."""
+    match = DATE_IN_NAME_RE.search(filename)
+    if match is None:
+        return None
+    day, month, year = (int(part) for part in match.groups())
+    if not (1 <= day <= 31 and 1 <= month <= 12):
+        return None
+    return day, month, year
+
+
+def unique_destination(directory, filename):
+    """Return a non-existing path in `directory` for `filename`, appending
+    ' (1)', ' (2)', ... before the extension on collisions."""
+    stem, ext = os.path.splitext(filename)
+    candidate = directory / filename
+    counter = 1
+    while candidate.exists():
+        candidate = directory / f"{stem} ({counter}){ext}"
+        counter += 1
+    return candidate
+
+
+def plan_month_moves(target_dir, recursive, group_by_day=False):
+    """Collect (source, destination_folder) pairs for every file whose name
+    contains a date. With `group_by_day` the destination is a day subfolder
+    named after the file's date inside the month folder, otherwise the month
+    folder itself. Files already inside their own destination, hidden files
+    and the toolkit's own output folders are left alone."""
+    plan = []
+
+    def consider(path):
+        if path.name.startswith("."):
+            return
+        parsed = extract_date_parts(path.name)
+        if parsed is None:
+            return
+        day, month, year = parsed
+        folder_name = f"{month:02d}-{year:04d}"
+        month_dir = target_dir / folder_name
+        if group_by_day:
+            dest_dir = month_dir / f"{day:02d}-{month:02d}-{year}"
+        else:
+            dest_dir = month_dir
+        if path.parent == dest_dir:
+            return                      # already in its destination folder
+        plan.append((path, dest_dir))
+
+    if recursive:
+        for root, dirs, files in os.walk(target_dir):
+            dirs[:] = [d for d in dirs
+                       if not d.startswith(".") and d not in OUTPUT_DIR_NAMES]
+            for name in files:
+                consider(Path(root) / name)
+    else:
+        for entry in target_dir.iterdir():
+            if entry.is_file():
+                consider(entry)
+    return plan
+
+
+def sort_files_into_month_folders(target_dir=TARGET_DIR):
+    def display(path):
+        try:
+            return str(path.relative_to(target_dir))
+        except ValueError:
+            return str(path)
+
+    print("Moves every file whose name contains a DD-MM-YYYY date into a")
+    print("month folder named MM-YYYY (e.g. 01-08-2026.jpg -> 08-2026/).")
+    answer = ask("Scan subfolders too? (Y/n): ")
+    if answer is None:
+        print("  [Cancelled]\n")
+        return
+    recursive = answer.strip().lower() not in ("n", "no")
+    answer = ask(
+        "Put each file inside a same-named day folder within the month\n"
+        "folder, e.g. 08-2026/01-08-2026/01-08-2026.jpg? (y/N): "
+    )
+    if answer is None:
+        print("  [Cancelled]\n")
+        return
+    group_by_day = answer.strip().lower() in ("y", "yes")
+
+    plan = plan_month_moves(target_dir, recursive, group_by_day)
+    if not plan:
+        print("No files with a DD-MM-YYYY date in their name were found.\n")
+        return
+
+    plan.sort(key=lambda item: str(item[0]))
+    print(f"\nFound {len(plan)} file(s) to move:")
+    for source, dest_dir in plan:
+        print(f"  {display(source)}  ->  {display(dest_dir / source.name)}")
+
+    confirm = ask(f"\nProceed with moving {len(plan)} file(s)? (Y/n): ")
+    if confirm is None or confirm.strip().lower() in ("n", "no"):
+        print("  [Cancelled] Nothing was moved.\n")
+        return
+
+    moved = 0
+    for source, dest_dir in plan:
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            destination = unique_destination(dest_dir, source.name)
+            shutil.move(str(source), str(destination))
+            moved += 1
+            print(f"  Moved: {display(source)} -> {display(destination)}")
+        except Exception as e:
+            print(f"  [Error] Failed to move {display(source)}: {e}")
+
+    print(f"\nDone! Moved {moved} of {len(plan)} file(s) into month folders.\n")
+
+
+# ==========================================================================
+# 8) One-click full pipeline: Index -> Build PDFs -> Hard link
 # ==========================================================================
 def run_full_pipeline():
     print("\n=== Running full pipeline: Index -> Build PDFs -> Hard Link ===\n")
@@ -311,23 +501,41 @@ def run_full_pipeline():
 # ==========================================================================
 # Menu
 # ==========================================================================
+def ask(prompt):
+    """input() that returns None on EOF/interrupt instead of crashing
+    (so piped runs and Ctrl-D end cleanly)."""
+    try:
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+
+
 MENU = """
 ==================== File Toolkit ====================
  1) Create day folders (01-MM-YYYY .. 31-MM-YYYY)
  2) Index files into database
- 3) Export files (copies every 0.jpeg)
+ 3) Export files (0.jpeg and DD-MM-YYYY.jpeg)
  4) Build PDFs from indexed folders
  5) Hard-link compiled PDFs into ./pdf
  6) One click: Index -> Build PDFs -> Hard Link
+ 7) Sort files into month folders (by date in filename)
  0) Exit
 ========================================================
 """
 
 
 def main():
+    config_note = str(ACTIVE_CONFIG) if ACTIVE_CONFIG else "defaults (no config file found)"
+    print(f"Config: {config_note}")
+    print(f"Working folder: {TARGET_DIR}\n")
     while True:
         print(MENU)
-        choice = input("Select an option: ").strip()
+        choice = ask("Select an option: ")
+        if choice is None:
+            print("Goodbye!")
+            break
+        choice = choice.strip()
 
         if choice == "1":
             create_day_folders()
@@ -341,6 +549,8 @@ def main():
             create_pdf_hardlinks()
         elif choice == "6":
             run_full_pipeline()
+        elif choice == "7":
+            sort_files_into_month_folders()
         elif choice == "0":
             print("Goodbye!")
             break
