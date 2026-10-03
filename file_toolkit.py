@@ -27,6 +27,24 @@ DEFAULT_SETTINGS = {
 }
 
 
+# Folder names that are themselves the tool's own structure: month
+# (08-2026) and day (01-08-2026) folders.
+DATE_DIR_NAME_RE = re.compile(r"\d{2}-\d{4}|\d{2}-\d{2}-\d{4}")
+
+
+def _climb_out_of_date_folders(folder):
+    """If `folder` is itself named like a month or day folder, work from
+    its parent instead — otherwise launching the app from inside e.g.
+    09-2026 would create a second 09-2026 inside it."""
+    climbed = folder
+    while DATE_DIR_NAME_RE.fullmatch(climbed.name) and climbed.parent != climbed:
+        climbed = climbed.parent
+    if climbed != folder:
+        print(f"[Config] Working folder moved up to '{climbed}' "
+              f"(was launched inside a date folder).")
+    return climbed
+
+
 def load_settings():
     """Read settings from a config file if one exists — the current directory
     first (local override), then next to the script — and resolve every path.
@@ -52,6 +70,7 @@ def load_settings():
     folder = Path(settings["folder"]).expanduser()
     if not folder.is_absolute():
         folder = Path.cwd() / folder
+    folder = _climb_out_of_date_folders(folder)
 
     def resolve(value):
         path = Path(value).expanduser()
@@ -190,7 +209,7 @@ def export_files(db_path=DB_NAME, output_dir=EXPORT_OUTPUT_DIR):
     rows = cursor.fetchall()
 
     for folder_name, filename, full_path in rows:
-        new_filename = f"{folder_name}_{filename}"
+        new_filename = f"{folder_name}_0"
         destination = os.path.join(output_dir, new_filename)
 
         try:

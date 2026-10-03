@@ -145,6 +145,10 @@ shows which config file and working folder are active.
 - The `export_output` and `pdf` folders (and the `files.db` file itself)
   are excluded from indexing/build/sorting steps so the tool never
   processes its own output as source material.
+- If the app is launched from inside a `MM-YYYY` month folder or a
+  `DD-MM-YYYY` day folder, it automatically works from the top-level
+  folder above them instead (it prints a notice when it does this), so
+  a second month folder is never created inside an existing one.
 - The month-folder sorter (option 7) only ever moves *files*, never
   directories — so your `DD-MM-YYYY` day folders are safe. Hidden folders
   (starting with `.`) and the tool's own `export_output` / `pdf` folders
