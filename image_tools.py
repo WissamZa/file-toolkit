@@ -11,8 +11,10 @@ shared config, prompts and helpers.
 """
 
 import os
+import re
 import shutil
 import sqlite3
+import uuid
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -73,8 +75,25 @@ def _open_db():
             new_value TEXT
         )
     ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS operation_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            op TEXT NOT NULL,
+            source TEXT,
+            destination TEXT,
+            detail TEXT
+        )
+    ''')
     conn.commit()
     return conn
+
+
+def _new_run_id():
+    """Short id tying together every operation of one menu action, so a
+    whole batch can be undone in one go."""
+    return uuid.uuid4().hex[:12]
 
 
 def _clamp(key, value):
@@ -279,11 +298,49 @@ def _adjust_threshold(conn, confirmed, spread, detail):
               "similar_yes" if confirmed else "similar_no", detail)
 
 
+def _parse_selection(text, maximum):
+    """Parse a group selection like '1,3-5' or 'a' into a sorted list of
+    group numbers. Raises ValueError on anything else."""
+    text = text.strip().lower()
+    if text in ("a", "all"):
+        return list(range(1, maximum + 1))
+    selected = set()
+    for token in re.split(r"[,\s]+", text):
+        if not token:
+            continue
+        match = re.fullmatch(r"(\d+)(?:-(\d+))?", token)
+        if match is None:
+            raise ValueError(token)
+        start = int(match.group(1))
+        end = int(match.group(2) or start)
+        if start > end or start < 1 or end > maximum:
+            raise ValueError(token)
+        selected.update(range(start, end + 1))
+    if not selected:
+        raise ValueError("nothing selected")
+    return sorted(selected)
+
+
+def _next_group_number(review_root):
+    """Smallest free suffix for group_XX folders already in the review dir,
+    so planned destinations can be shown before anything moves."""
+    numbers = [0]
+    if review_root.is_dir():
+        for path in review_root.glob("group_*"):
+            match = re.fullmatch(r"group_(\d+)", path.name)
+            if match and path.is_dir():
+                numbers.append(int(match.group(1)))
+    return max(numbers) + 1
+
+
 def group_similar_images():
-    """Menu action: find clusters of perceptually similar images and, per
-    cluster, move them to the review folder or teach the threshold."""
+    """Menu action: find clusters of perceptually similar images, show the
+    complete move plan (every source and its destination) and move only the
+    groups the user picks. Every move is written to the operation log so the
+    batch can be undone."""
     print("Finds groups of similar images via perceptual hashing (offline).")
-    print("Nothing is deleted — grouped images go to a review folder.\n")
+    print("Nothing moves until you pick the groups, and every move is")
+    print("logged so it can be undone.\n")
 
     conn = _open_db()
     try:
@@ -300,67 +357,79 @@ def group_similar_images():
             print(f"No similar images found (threshold {threshold}).\n")
             return
 
-        print(f"\nFound {len(groups)} group(s) of similar images "
-              f"(threshold {threshold}).")
         review_root = Path(tk.SIMILAR_REVIEW_DIR)
-        existing = [p for p in review_root.glob("group_*") if p.is_dir()] \
-            if review_root.is_dir() else []
-        next_group = len(existing) + 1
-        moved_total = groups_handled = 0
+        first_number = _next_group_number(review_root)
+        plan = [
+            (number, members, spread,
+             review_root / f"group_{first_number + number - 1:02d}")
+            for number, (members, spread) in enumerate(groups, 1)
+        ]
 
-        for members, spread in groups:
-            groups_handled += 1
-            print(f"\nGroup {groups_handled}/{len(groups)} "
-                  f"— {len(members)} image(s), spread {spread}:")
-            first = members[0]
+        print(f"\nFound {len(plan)} group(s) of similar images "
+              f"(threshold {threshold}). Move plan:\n")
+        for number, members, spread, dest_dir in plan:
+            print(f"Group {number} (spread {spread}) -> {dest_dir}/")
             for member in members:
-                distance = hashes[first][0] - hashes[member][0]
-                print(f"    {member}  (d={distance})")
+                print(f"    {member}")
+        print()
 
-            answer = tk.ask(
-                "  (m)ove group to review folder / (k)eep / "
-                "(n)ot similar / (q)uit: ")
-            if answer is None:
-                print("  [Cancelled]\n")
-                break
-            answer = answer.strip().lower()
+        answer = tk.ask(
+            "Move which groups? (e.g. 1,3-5 | a = all | Enter = cancel): ")
+        if answer is None or not answer.strip():
+            print("  [Cancelled] Nothing was moved.\n")
+            return
+        try:
+            selected = _parse_selection(answer, len(plan))
+        except ValueError as e:
+            print(f"  [Cancelled] Invalid selection: {e}\n")
+            return
+        chosen = [entry for entry in plan if entry[0] in selected]
 
-            if answer == "q":
-                break
-            if answer == "n":
-                _adjust_threshold(conn, confirmed=False, spread=spread,
-                                  detail="group marked not similar")
-                continue
-            if answer in ("m", "k"):
-                confirmed = True
-            else:
-                print("  [Skipped] Unrecognised answer.\n")
-                continue
-
-            if answer == "m":
-                dest_dir = review_root / f"group_{next_group:02d}"
-                next_group += 1
-                dest_dir.mkdir(parents=True, exist_ok=True)
-                moved = 0
-                for member in members:
-                    try:
-                        destination = tk.unique_destination(
-                            dest_dir, Path(member).name)
-                        shutil.move(member, str(destination))
-                        conn.execute(
-                            "DELETE FROM image_hashes WHERE full_path = ?",
-                            (member,))
-                        moved += 1
-                    except Exception as e:
-                        print(f"  [Error] Failed to move {member}: {e}")
-                conn.commit()
-                moved_total += moved
-                print(f"  Moved {moved} image(s) to {dest_dir}")
+        run_id = _new_run_id()
+        moved_total = 0
+        for number, members, spread, dest_dir in chosen:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            moved = 0
+            for member in members:
+                try:
+                    destination = tk.unique_destination(
+                        dest_dir, Path(member).name)
+                    shutil.move(member, str(destination))
+                    conn.execute(
+                        "INSERT INTO operation_log "
+                        "(ts, run_id, op, source, destination, detail) "
+                        "VALUES (?, ?, 'move', ?, ?, ?)",
+                        (datetime.now().isoformat(timespec="seconds"),
+                         run_id, member, str(destination),
+                         f"similar group {number}"))
+                    conn.execute(
+                        "DELETE FROM image_hashes WHERE full_path = ?",
+                        (member,))
+                    moved += 1
+                except Exception as e:
+                    print(f"  [Error] Failed to move {member}: {e}")
+            conn.commit()
+            moved_total += moved
+            print(f"  Group {number}: moved {moved} image(s) to {dest_dir}")
             _adjust_threshold(conn, confirmed=True, spread=spread,
-                              detail="group confirmed as similar")
+                              detail="group moved to review")
 
-        print(f"\nDone! {moved_total} image(s) moved to "
-              f"'{tk.SIMILAR_REVIEW_DIR}' for review.\n")
+        answer = tk.ask(
+            "\nMark any untouched group as NOT similar? Teaches the "
+            "threshold (e.g. 2,4 | Enter = none): ")
+        if answer and answer.strip():
+            try:
+                rejected = _parse_selection(answer, len(plan))
+            except ValueError as e:
+                print(f"  [Skipped] Invalid selection: {e}")
+                rejected = []
+            for number, _, spread, _ in plan:
+                if number in rejected and number not in selected:
+                    _adjust_threshold(conn, confirmed=False, spread=spread,
+                                      detail="group marked not similar")
+
+        print(f"\nDone! {moved_total} image(s) moved in batch {run_id} —")
+        print("undo it with menu option 12 if the groups look wrong.\n")
     finally:
         conn.close()
 
@@ -439,6 +508,7 @@ def auto_crop_images():
               f"tolerance {tolerance}, min gain {min_gain}%.\n")
 
         out_root = Path(tk.CROPPED_OUTPUT_DIR)
+        run_id = _new_run_id()
         cropped = skipped = failed = 0
         for path in files:
             try:
@@ -473,6 +543,13 @@ def auto_crop_images():
                             save_kwargs["exif"] = img.info["exif"]
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     cropped_img.save(destination, **save_kwargs)
+                    conn.execute(
+                        "INSERT INTO operation_log "
+                        "(ts, run_id, op, source, destination, detail) "
+                        "VALUES (?, ?, 'crop', ?, ?, ?)",
+                        (datetime.now().isoformat(timespec="seconds"),
+                         run_id, str(path), str(destination),
+                         f"margin {margin}, tolerance {tolerance}"))
                     print(f"  {rel}: {img.width}x{img.height} -> "
                           f"{cropped_img.width}x{cropped_img.height} "
                           f"(freed {gain:.0f}%)")
@@ -482,9 +559,11 @@ def auto_crop_images():
                 failed += 1
 
         print(f"\nDone! {cropped} image(s) cropped, {skipped} skipped, "
-              f"{failed} failed. Results are in '{tk.CROPPED_OUTPUT_DIR}'.")
+              f"{failed} failed. Results are in '{tk.CROPPED_OUTPUT_DIR}' "
+              f"(batch {run_id}).")
         print("Review them, then use the crop feedback option to teach the")
-        print("cropper what 'good' looks like.\n")
+        print("cropper what 'good' looks like — or option 12 to undo the")
+        print("whole batch.\n")
     finally:
         conn.close()
 
@@ -541,7 +620,72 @@ def crop_feedback():
 
 
 # ==========================================================================
-# 5) Learning status
+# 5) Undo the last move/crop batch
+# ==========================================================================
+def undo_last_operation():
+    """Menu action: revert the most recent move/crop batch from the
+    operation log — moved images go back to their original paths and
+    cropped copies are deleted."""
+    conn = _open_db()
+    try:
+        last = conn.execute(
+            "SELECT run_id FROM operation_log ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if last is None:
+            print("Nothing to undo — the operation log is empty.\n")
+            return
+        run_id = last[0]
+        rows = conn.execute(
+            "SELECT id, op, source, destination, detail FROM operation_log "
+            "WHERE run_id = ? ORDER BY id", (run_id,)).fetchall()
+
+        counts = defaultdict(int)
+        for _, op, _, _, _ in rows:
+            counts[op] += 1
+        summary = ", ".join(f"{count} {name} operation(s)"
+                            for name, count in sorted(counts.items()))
+        print(f"Last batch (run {run_id}): {summary}.")
+        answer = tk.ask("Undo it? (Y/n): ")
+        if answer is None or answer.strip().lower() in ("n", "no"):
+            print("  [Cancelled]\n")
+            return
+
+        reverted = failed = 0
+        for row_id, op, source, destination, detail in rows:
+            try:
+                if op == "move":
+                    if not os.path.exists(destination):
+                        print(f"  [Skipped] {destination} is already gone")
+                    else:
+                        Path(source).parent.mkdir(parents=True,
+                                                  exist_ok=True)
+                        target = tk.unique_destination(
+                            Path(source).parent, Path(source).name)
+                        shutil.move(destination, str(target))
+                        note = ("" if target == source else
+                                f" (renamed to {target.name} — path taken)")
+                        print(f"  Restored {destination} -> {source}{note}")
+                elif op == "crop":
+                    if os.path.exists(destination):
+                        os.remove(destination)
+                        print(f"  Removed cropped copy {destination}")
+                    else:
+                        print(f"  [Skipped] {destination} is already gone")
+                conn.execute("DELETE FROM operation_log WHERE id = ?",
+                             (row_id,))
+                reverted += 1
+            except Exception as e:
+                print(f"  [Error] Could not undo {detail or op}: {e}")
+                failed += 1
+        conn.commit()
+        print(f"\nDone! {reverted} operation(s) undone"
+              + (f", {failed} failed" if failed else "") + ".\n")
+    finally:
+        conn.close()
+
+
+# ==========================================================================
+# 6) Learning status
 # ==========================================================================
 def learning_status():
     """Menu action: show what the toolkit has learned and optionally reset."""

@@ -551,6 +551,7 @@ MENU = """
  9) Auto-crop document photos into ./auto_cropped
 10) Crop feedback: teach the cropper what worked
 11) Show learned settings / reset learning
+12) Undo last image move/crop batch
  0) Exit
 ========================================================
 """
@@ -610,6 +611,10 @@ def main():
             tools = _image_tools()
             if tools:
                 tools.learning_status()
+        elif choice == "12":
+            tools = _image_tools()
+            if tools:
+                tools.undo_last_operation()
         elif choice == "0":
             print("Goodbye!")
             break
