@@ -553,6 +553,7 @@ MENU = """
 11) Show learned settings / reset learning
 12) Undo last image move/crop batch
 13) Image teaching GUI (opens in your browser)
+14) Quick Renamer GUI (rename + metadata, uses the working folder)
  0) Exit
 ========================================================
 """
@@ -621,9 +622,17 @@ def main():
                 try:
                     import image_gui
                 except ImportError as e:
-                    print(f"  [Error] The GUI needs its packages: {e}\n")
+                    print(f"  [Error] The GUI needs tkinter (python3-tk): {e}\n")
                     continue
                 image_gui.run()
+        elif choice == "14":
+            try:
+                import quick_renamer
+            except ImportError as e:
+                print(f"  [Error] The renamer needs tkinter (python3-tk): {e}\n")
+                continue
+            print("  [Renamer] Close its window to return to this menu.\n")
+            quick_renamer.main(folder=str(TARGET_DIR))
         elif choice == "0":
             print("Goodbye!")
             break

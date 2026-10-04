@@ -239,6 +239,12 @@ def hashes_for_files(conn, files):
             "(full_path, mtime, phash, dhash) VALUES (?, ?, ?, ?)",
             fresh_rows,
         )
+        # Files renamed or moved outside this module leave stale rows
+        # behind (e.g. via the Quick Renamer GUI) — drop them.
+        stale = [path for path in cache if not os.path.exists(path)]
+        for path in stale:
+            conn.execute("DELETE FROM image_hashes WHERE full_path = ?",
+                         (path,))
         conn.commit()
     return hashes
 
@@ -467,6 +473,132 @@ def group_similar_images():
 # ==========================================================================
 # 4) Automatic document cropping
 # ==========================================================================
+def _content_bbox(arr, tolerance):
+    """Bounding box (left, top, right, bottom) of everything that differs
+    from the border colour, ignoring sparse noise rows/columns. Returns None
+    when the image looks uniformly one colour."""
+    height, width, _ = arr.shape
+    frame = max(2, min(height, width) // 50)
+    samples = np.concatenate([
+        arr[:frame].reshape(-1, 3),
+        arr[-frame:].reshape(-1, 3),
+        arr[:, :frame].reshape(-1, 3),
+        arr[:, -frame:].reshape(-1, 3),
+    ])
+    background = np.median(samples, axis=0)
+
+    diff = np.abs(arr - background).max(axis=2)
+    mask = diff > tolerance
+    if not mask.any():
+        return None
+
+    # A row/column counts as content only if enough of it differs from the
+    # background — filters dust specks and sensor noise.
+    row_cut = max(3, int(width * 0.005))
+    col_cut = max(3, int(height * 0.005))
+    rows = np.where(mask.sum(axis=1) > row_cut)[0]
+    cols = np.where(mask.sum(axis=0) > col_cut)[0]
+    if rows.size == 0 or cols.size == 0:
+        return None
+    return int(cols[0]), int(rows[0]), int(cols[-1]) + 1, int(rows[-1]) + 1
+
+
+def compute_crop(img, margin, tolerance):
+    """Crop box around the document in `img`, or (None, reason) when there
+    is nothing worth cutting. `img` must already be orientation-corrected."""
+    arr = np.asarray(img.convert("RGB"), dtype=np.int16)
+    bbox = _content_bbox(arr, tolerance)
+    if bbox is None:
+        return None, "image looks uniformly one colour"
+    left, top, right, bottom = bbox
+    left = max(0, left - margin)
+    top = max(0, top - margin)
+    right = min(img.width, right + margin)
+    bottom = min(img.height, bottom + margin)
+    return (left, top, right, bottom), None
+
+
+def auto_crop_images():
+    """Menu action: trim the background around every document photo. The
+    originals are never touched — results go to the auto_cropped folder."""
+    print("Cuts the background off document photos and saves the result in")
+    print(f"'{tk.CROPPED_OUTPUT_DIR}' — original files are never modified.\n")
+
+    answer = tk.ask("Scan subfolders too? (Y/n): ")
+    if answer is None:
+        print("  [Cancelled]\n")
+        return
+    recursive = answer.strip().lower() not in ("n", "no")
+
+    files = collect_image_files(tk.TARGET_DIR, recursive=recursive)
+    if not files:
+        print("No images found in the working folder.\n")
+        return
+
+    conn = _open_db()
+    try:
+        margin = get_param(conn, "crop_margin")
+        tolerance = get_param(conn, "crop_tolerance")
+        min_gain = get_param(conn, "crop_min_gain")
+        print(f"Using learned settings: margin {margin}px, "
+              f"tolerance {tolerance}, min gain {min_gain}%.\n")
+
+        out_root = Path(tk.CROPPED_OUTPUT_DIR)
+        run_id = _new_run_id()
+        cropped = skipped = failed = 0
+        for path in files:
+            try:
+                rel = path.relative_to(tk.TARGET_DIR)
+            except ValueError:
+                rel = Path(path.name)
+            destination = tk.unique_destination(out_root / rel.parent,
+                                                rel.name)
+            try:
+                with Image.open(path) as img:
+                    img = ImageOps.exif_transpose(img)
+                    box, reason = compute_crop(img, margin, tolerance)
+                    if box is None:
+                        print(f"  [Skipped] {rel}: {reason}")
+                        skipped += 1
+                        continue
+                    left, top, right, bottom = box
+                    old_area = img.width * img.height
+                    new_area = (right - left) * (bottom - top)
+                    gain = (old_area - new_area) / old_area * 100
+                    if gain < min_gain:
+                        print(f"  [Skipped] {rel}: already tight "
+                              f"(cropping would free only {gain:.1f}%)")
+                        skipped += 1
+                        continue
+
+                    _save_cropped(img, box, destination)
+                    conn.execute(
+                        "INSERT INTO operation_log "
+                        "(ts, run_id, op, source, destination, "
+                        " detail, status) "
+                        "VALUES (?, ?, 'crop', ?, ?, ?, 'approved')",
+                        (datetime.now().isoformat(timespec="seconds"),
+                         run_id, str(path), str(destination),
+                         f"margin {margin}, tolerance {tolerance}"))
+                    print(f"  {rel}: {img.width}x{img.height} -> "
+                          f"{right - left}x{bottom - top} "
+                          f"(freed {gain:.0f}%)")
+                    cropped += 1
+            except Exception as e:
+                print(f"  [Error] Failed to crop {rel}: {e}")
+                failed += 1
+
+        conn.commit()
+        print(f"\nDone! {cropped} image(s) cropped, {skipped} skipped, "
+              f"{failed} failed. Results are in '{tk.CROPPED_OUTPUT_DIR}' "
+              f"(batch {run_id}).")
+        print("Review them, then use the crop feedback option to teach the")
+        print("cropper what 'good' looks like — or option 12 to undo the")
+        print("whole batch.\n")
+    finally:
+        conn.close()
+
+
 def _save_cropped(img, box, destination):
     """Write the cropped region of `img` to `destination` (keeping format
     and EXIF where possible)."""
@@ -611,131 +743,6 @@ def review_operations(conn, approve_ids, reject_ids):
                      "WHERE id = ?", (op_id,))
     conn.commit()
     return removed
-
-
-def _content_bbox(arr, tolerance):
-    """Bounding box (left, top, right, bottom) of everything that differs
-    from the border colour, ignoring sparse noise rows/columns. Returns None
-    when the image looks uniformly one colour."""
-    height, width, _ = arr.shape
-    frame = max(2, min(height, width) // 50)
-    samples = np.concatenate([
-        arr[:frame].reshape(-1, 3),
-        arr[-frame:].reshape(-1, 3),
-        arr[:, :frame].reshape(-1, 3),
-        arr[:, -frame:].reshape(-1, 3),
-    ])
-    background = np.median(samples, axis=0)
-
-    diff = np.abs(arr - background).max(axis=2)
-    mask = diff > tolerance
-    if not mask.any():
-        return None
-
-    # A row/column counts as content only if enough of it differs from the
-    # background — filters dust specks and sensor noise.
-    row_cut = max(3, int(width * 0.005))
-    col_cut = max(3, int(height * 0.005))
-    rows = np.where(mask.sum(axis=1) > row_cut)[0]
-    cols = np.where(mask.sum(axis=0) > col_cut)[0]
-    if rows.size == 0 or cols.size == 0:
-        return None
-    return int(cols[0]), int(rows[0]), int(cols[-1]) + 1, int(rows[-1]) + 1
-
-
-def compute_crop(img, margin, tolerance):
-    """Crop box around the document in `img`, or (None, reason) when there
-    is nothing worth cutting. `img` must already be orientation-corrected."""
-    arr = np.asarray(img.convert("RGB"), dtype=np.int16)
-    bbox = _content_bbox(arr, tolerance)
-    if bbox is None:
-        return None, "image looks uniformly one colour"
-    left, top, right, bottom = bbox
-    left = max(0, left - margin)
-    top = max(0, top - margin)
-    right = min(img.width, right + margin)
-    bottom = min(img.height, bottom + margin)
-    return (left, top, right, bottom), None
-
-
-def auto_crop_images():
-    """Menu action: trim the background around every document photo. The
-    originals are never touched — results go to the auto_cropped folder."""
-    print("Cuts the background off document photos and saves the result in")
-    print(f"'{tk.CROPPED_OUTPUT_DIR}' — original files are never modified.\n")
-
-    answer = tk.ask("Scan subfolders too? (Y/n): ")
-    if answer is None:
-        print("  [Cancelled]\n")
-        return
-    recursive = answer.strip().lower() not in ("n", "no")
-
-    files = collect_image_files(tk.TARGET_DIR, recursive=recursive)
-    if not files:
-        print("No images found in the working folder.\n")
-        return
-
-    conn = _open_db()
-    try:
-        margin = get_param(conn, "crop_margin")
-        tolerance = get_param(conn, "crop_tolerance")
-        min_gain = get_param(conn, "crop_min_gain")
-        print(f"Using learned settings: margin {margin}px, "
-              f"tolerance {tolerance}, min gain {min_gain}%.\n")
-
-        out_root = Path(tk.CROPPED_OUTPUT_DIR)
-        run_id = _new_run_id()
-        cropped = skipped = failed = 0
-        for path in files:
-            try:
-                rel = path.relative_to(tk.TARGET_DIR)
-            except ValueError:
-                rel = Path(path.name)
-            destination = tk.unique_destination(out_root / rel.parent,
-                                                rel.name)
-            try:
-                with Image.open(path) as img:
-                    img = ImageOps.exif_transpose(img)
-                    box, reason = compute_crop(img, margin, tolerance)
-                    if box is None:
-                        print(f"  [Skipped] {rel}: {reason}")
-                        skipped += 1
-                        continue
-                    left, top, right, bottom = box
-                    old_area = img.width * img.height
-                    new_area = (right - left) * (bottom - top)
-                    gain = (old_area - new_area) / old_area * 100
-                    if gain < min_gain:
-                        print(f"  [Skipped] {rel}: already tight "
-                              f"(cropping would free only {gain:.1f}%)")
-                        skipped += 1
-                        continue
-
-                    _save_cropped(img, box, destination)
-                    conn.execute(
-                        "INSERT INTO operation_log "
-                        "(ts, run_id, op, source, destination, "
-                        " detail, status) "
-                        "VALUES (?, ?, 'crop', ?, ?, ?, 'approved')",
-                        (datetime.now().isoformat(timespec="seconds"),
-                         run_id, str(path), str(destination),
-                         f"margin {margin}, tolerance {tolerance}"))
-                    print(f"  {rel}: {img.width}x{img.height} -> "
-                          f"{right - left}x{bottom - top} "
-                          f"(freed {gain:.0f}%)")
-                    cropped += 1
-            except Exception as e:
-                print(f"  [Error] Failed to crop {rel}: {e}")
-                failed += 1
-
-        print(f"\nDone! {cropped} image(s) cropped, {skipped} skipped, "
-              f"{failed} failed. Results are in '{tk.CROPPED_OUTPUT_DIR}' "
-              f"(batch {run_id}).")
-        print("Review them, then use the crop feedback option to teach the")
-        print("cropper what 'good' looks like — or option 12 to undo the")
-        print("whole batch.\n")
-    finally:
-        conn.close()
 
 
 def crop_feedback():
