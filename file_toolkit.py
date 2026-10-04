@@ -552,6 +552,7 @@ MENU = """
 10) Crop feedback: teach the cropper what worked
 11) Show learned settings / reset learning
 12) Undo last image move/crop batch
+13) Image teaching GUI (opens in your browser)
  0) Exit
 ========================================================
 """
@@ -615,6 +616,14 @@ def main():
             tools = _image_tools()
             if tools:
                 tools.undo_last_operation()
+        elif choice == "13":
+            if _image_tools():
+                try:
+                    import image_gui
+                except ImportError as e:
+                    print(f"  [Error] The GUI needs its packages: {e}\n")
+                    continue
+                image_gui.run()
         elif choice == "0":
             print("Goodbye!")
             break

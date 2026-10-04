@@ -28,6 +28,14 @@ import file_toolkit as tk
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff'}
 
+# Image types the user can teach the toolkit (Arabic labels for the GUI).
+TYPE_LABELS = {
+    "income": "ورقة الدخل",
+    "invoice": "فاتورة",
+    "receipt": "إيصال",
+    "other": "أخرى",
+}
+
 # Learnable parameters: defaults, and the range the feedback loop may move
 # them into. Keys live in the learning_state table; anything absent simply
 # uses the default.
@@ -83,9 +91,31 @@ def _open_db():
             op TEXT NOT NULL,
             source TEXT,
             destination TEXT,
-            detail TEXT
+            detail TEXT,
+            status TEXT NOT NULL DEFAULT 'approved'
         )
     ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS crop_examples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            img_w INTEGER NOT NULL,
+            img_h INTEGER NOT NULL,
+            type TEXT NOT NULL,
+            box_l REAL NOT NULL,
+            box_t REAL NOT NULL,
+            box_r REAL NOT NULL,
+            box_b REAL NOT NULL,
+            low_quality INTEGER NOT NULL DEFAULT 0
+        )
+    ''')
+    # Older databases predate the status column — add it in place.
+    columns = {row[1] for row in conn.execute(
+        "PRAGMA table_info(operation_log)")}
+    if "status" not in columns:
+        conn.execute("ALTER TABLE operation_log ADD COLUMN "
+                     "status TEXT NOT NULL DEFAULT 'approved'")
     conn.commit()
     return conn
 
@@ -437,6 +467,152 @@ def group_similar_images():
 # ==========================================================================
 # 4) Automatic document cropping
 # ==========================================================================
+def _save_cropped(img, box, destination):
+    """Write the cropped region of `img` to `destination` (keeping format
+    and EXIF where possible)."""
+    cropped = img.crop(box)
+    save_kwargs = {}
+    if destination.suffix.lower() in (".jpg", ".jpeg"):
+        save_kwargs = {"quality": 95}
+        if "exif" in img.info:
+            save_kwargs["exif"] = img.info["exif"]
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    cropped.save(destination, **save_kwargs)
+    return cropped
+
+
+def save_crop_example(conn, source_path, img_size, type_, box,
+                      low_quality=False):
+    """Store a user-taught crop as a normalized example the autonomous mode
+    can apply to other images of the same dimensions."""
+    width, height = img_size
+    left, top, right, bottom = box
+    conn.execute(
+        "INSERT INTO crop_examples (ts, source_path, img_w, img_h, type, "
+        "box_l, box_t, box_r, box_b, low_quality) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (datetime.now().isoformat(timespec="seconds"), str(source_path),
+         width, height, type_, left / width, top / height,
+         right / width, bottom / height, int(bool(low_quality))))
+    conn.commit()
+
+
+def learned_crop(conn, img):
+    """Crop box from what the toolkit was taught, falling back to
+    auto-detection. Returns (box or None, method, predicted_type) where
+    method is 'taught' or 'auto'.
+
+    Teaching works per image size: screenshots and scans usually share
+    exact dimensions per source, so the average normalized box of every
+    taught example at this size is the crop."""
+    width, height = img.size
+    row = conn.execute(
+        "SELECT type, AVG(box_l), AVG(box_t), AVG(box_r), AVG(box_b) "
+        "FROM crop_examples WHERE img_w = ? AND img_h = ? "
+        "GROUP BY type ORDER BY COUNT(*) DESC LIMIT 1",
+        (width, height)).fetchone()
+    if row is not None:
+        type_, nl, nt, nr, nb = row
+        left = max(0, min(width - 1, round(nl * width)))
+        top = max(0, min(height - 1, round(nt * height)))
+        right = max(left + 1, min(width, round(nr * width)))
+        bottom = max(top + 1, min(height, round(nb * height)))
+        return (left, top, right, bottom), "taught", type_
+
+    margin = get_param(conn, "crop_margin")
+    tolerance = get_param(conn, "crop_tolerance")
+    arr = np.asarray(img.convert("RGB"), dtype=np.int16)
+    bbox = _content_bbox(arr, tolerance)
+    if bbox is None:
+        return None, "auto", None
+    left, top, right, bottom = bbox
+    left = max(0, left - margin)
+    top = max(0, top - margin)
+    right = min(width, right + margin)
+    bottom = min(height, bottom + margin)
+    return (left, top, right, bottom), "auto", None
+
+
+def run_autonomous_crop():
+    """Work mode: crop every image using the learned model and record each
+    copy as a pending operation awaiting user approval. Returns
+    (run_id, created, skipped)."""
+    conn = _open_db()
+    try:
+        files = collect_image_files(tk.TARGET_DIR)
+        out_root = Path(tk.CROPPED_OUTPUT_DIR)
+        run_id = _new_run_id()
+        min_gain = get_param(conn, "crop_min_gain")
+        created = skipped = 0
+        for path in files:
+            try:
+                rel = path.relative_to(tk.TARGET_DIR)
+            except ValueError:
+                rel = Path(path.name)
+            try:
+                with Image.open(path) as img:
+                    img = ImageOps.exif_transpose(img)
+                    box, method, type_ = learned_crop(conn, img)
+                    if box is None:
+                        print(f"  [Skipped] {rel}: nothing to crop")
+                        skipped += 1
+                        continue
+                    left, top, right, bottom = box
+                    old_area = img.width * img.height
+                    gain = (old_area - (right - left) * (bottom - top)) \
+                        / old_area * 100
+                    if gain < min_gain:
+                        skipped += 1
+                        continue
+                    destination = tk.unique_destination(
+                        out_root / rel.parent, rel.name)
+                    _save_cropped(img, box, destination)
+                    conn.execute(
+                        "INSERT INTO operation_log "
+                        "(ts, run_id, op, source, destination, detail, "
+                        " status) VALUES (?, ?, 'crop', ?, ?, ?, 'pending')",
+                        (datetime.now().isoformat(timespec="seconds"),
+                         run_id, str(path), str(destination),
+                         f"method={method}, type={type_ or 'unknown'}"))
+                    print(f"  [Pending approval] {rel} "
+                          f"({method}, {TYPE_LABELS.get(type_, type_)})")
+                    created += 1
+            except Exception as e:
+                print(f"  [Error] {rel}: {e}")
+        conn.commit()
+        return run_id, created, skipped
+    finally:
+        conn.close()
+
+
+def pending_operations(conn):
+    """Operations recorded but not yet approved or rejected by the user."""
+    return conn.execute(
+        "SELECT id, ts, op, source, destination, detail FROM operation_log "
+        "WHERE status = 'pending' ORDER BY id").fetchall()
+
+
+def review_operations(conn, approve_ids, reject_ids):
+    """Approve or reject pending operations; rejecting a crop deletes the
+    generated copy. Returns the number of rejected copies removed."""
+    removed = 0
+    for op_id in reject_ids:
+        row = conn.execute(
+            "SELECT op, destination FROM operation_log WHERE id = ?",
+            (op_id,)).fetchone()
+        if row is not None and row[0] == "crop" \
+                and row[1] and os.path.exists(row[1]):
+            os.remove(row[1])
+            removed += 1
+        conn.execute("UPDATE operation_log SET status = 'rejected' "
+                     "WHERE id = ?", (op_id,))
+    for op_id in approve_ids:
+        conn.execute("UPDATE operation_log SET status = 'approved' "
+                     "WHERE id = ?", (op_id,))
+    conn.commit()
+    return removed
+
+
 def _content_bbox(arr, tolerance):
     """Bounding box (left, top, right, bottom) of everything that differs
     from the border colour, ignoring sparse noise rows/columns. Returns None
@@ -535,23 +711,17 @@ def auto_crop_images():
                         skipped += 1
                         continue
 
-                    cropped_img = img.crop(box)
-                    save_kwargs = {}
-                    if destination.suffix.lower() in (".jpg", ".jpeg"):
-                        save_kwargs = {"quality": 95}
-                        if "exif" in img.info:
-                            save_kwargs["exif"] = img.info["exif"]
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    cropped_img.save(destination, **save_kwargs)
+                    _save_cropped(img, box, destination)
                     conn.execute(
                         "INSERT INTO operation_log "
-                        "(ts, run_id, op, source, destination, detail) "
-                        "VALUES (?, ?, 'crop', ?, ?, ?)",
+                        "(ts, run_id, op, source, destination, "
+                        " detail, status) "
+                        "VALUES (?, ?, 'crop', ?, ?, ?, 'approved')",
                         (datetime.now().isoformat(timespec="seconds"),
                          run_id, str(path), str(destination),
                          f"margin {margin}, tolerance {tolerance}"))
                     print(f"  {rel}: {img.width}x{img.height} -> "
-                          f"{cropped_img.width}x{cropped_img.height} "
+                          f"{right - left}x{bottom - top} "
                           f"(freed {gain:.0f}%)")
                     cropped += 1
             except Exception as e:
@@ -622,10 +792,12 @@ def crop_feedback():
 # ==========================================================================
 # 5) Undo the last move/crop batch
 # ==========================================================================
-def undo_last_operation():
-    """Menu action: revert the most recent move/crop batch from the
-    operation log — moved images go back to their original paths and
-    cropped copies are deleted."""
+def undo_last_operation(ask_fn=None):
+    """Revert the most recent move/crop batch from the operation log — moved
+    images go back to their original paths and cropped copies are deleted.
+    `ask_fn` overrides the confirmation prompt (GUIs pass their own); returns
+    (reverted, failed)."""
+    ask_fn = ask_fn or tk.ask
     conn = _open_db()
     try:
         last = conn.execute(
@@ -633,7 +805,7 @@ def undo_last_operation():
         ).fetchone()
         if last is None:
             print("Nothing to undo — the operation log is empty.\n")
-            return
+            return 0, 0
         run_id = last[0]
         rows = conn.execute(
             "SELECT id, op, source, destination, detail FROM operation_log "
@@ -645,10 +817,10 @@ def undo_last_operation():
         summary = ", ".join(f"{count} {name} operation(s)"
                             for name, count in sorted(counts.items()))
         print(f"Last batch (run {run_id}): {summary}.")
-        answer = tk.ask("Undo it? (Y/n): ")
+        answer = ask_fn("Undo it? (Y/n): ")
         if answer is None or answer.strip().lower() in ("n", "no"):
             print("  [Cancelled]\n")
-            return
+            return 0, 0
 
         reverted = failed = 0
         for row_id, op, source, destination, detail in rows:
@@ -680,6 +852,7 @@ def undo_last_operation():
         conn.commit()
         print(f"\nDone! {reverted} operation(s) undone"
               + (f", {failed} failed" if failed else "") + ".\n")
+        return reverted, failed
     finally:
         conn.close()
 
