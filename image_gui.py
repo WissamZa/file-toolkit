@@ -138,7 +138,17 @@ class Handler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
 
         if route == "/" or route == "/index.html":
-            self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+            # '?shot' delays the load event until the boot fetches have
+            # painted — used to take reproducible screenshots of the UI.
+            page = PAGE
+            if "shot" in query:
+                page = page.replace(
+                    "</body>", '<script src="/api/slow"></script></body>')
+            self._send(200, page.encode(), "text/html; charset=utf-8")
+        elif route == "/api/slow":
+            import time as _time
+            _time.sleep(1.0)
+            self._send(200, b"", "application/javascript")
         elif route == "/img":
             raw = (query.get("path") or [""])[0]
             max_px = min(1600, int((query.get("max") or ["340"])[0]))

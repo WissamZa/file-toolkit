@@ -171,7 +171,17 @@ class Handler(BaseHTTPRequestHandler):
         route, query = parsed.path, parse_qs(parsed.query)
 
         if route in ("/", "/index.html"):
-            self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+            # '?shot' delays the load event until the boot fetches have
+            # painted — used to take reproducible screenshots of the UI.
+            page = PAGE
+            if "shot" in query:
+                page = page.replace(
+                    "</body>", '<script src="/api/slow"></script></body>')
+            self._send(200, page.encode(), "text/html; charset=utf-8")
+        elif route == "/api/slow":
+            import time as _time
+            _time.sleep(2.5)
+            self._send(200, b"", "application/javascript")
         elif route == "/api/config":
             cfg = _config()
             self._json(200, {k: cfg[k] for k in
