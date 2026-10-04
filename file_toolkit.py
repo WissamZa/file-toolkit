@@ -24,6 +24,8 @@ DEFAULT_SETTINGS = {
     "database": "files.db",
     "export_output": "export_output",
     "pdf_dir": "pdf",
+    "similar_review": "similar_review",
+    "cropped_output": "auto_cropped",
 }
 
 
@@ -81,6 +83,8 @@ def load_settings():
         "database": str(resolve(settings["database"])),
         "export_output": str(resolve(settings["export_output"])),
         "pdf_dir": str(resolve(settings["pdf_dir"])),
+        "similar_review": str(resolve(settings["similar_review"])),
+        "cropped_output": str(resolve(settings["cropped_output"])),
         "config_path": config_path,
     }
 
@@ -90,12 +94,16 @@ TARGET_DIR = _SETTINGS["folder"]          # directory the toolkit operates on
 DB_NAME = _SETTINGS["database"]
 EXPORT_OUTPUT_DIR = _SETTINGS["export_output"]
 PDF_LINK_DIR = _SETTINGS["pdf_dir"]
+SIMILAR_REVIEW_DIR = _SETTINGS["similar_review"]
+CROPPED_OUTPUT_DIR = _SETTINGS["cropped_output"]
 ACTIVE_CONFIG = _SETTINGS["config_path"]
 
 # Basenames of the toolkit's own output folders, never indexed or sorted
 OUTPUT_DIR_NAMES = {
     os.path.basename(os.path.normpath(EXPORT_OUTPUT_DIR)),
     os.path.basename(os.path.normpath(PDF_LINK_DIR)),
+    os.path.basename(os.path.normpath(SIMILAR_REVIEW_DIR)),
+    os.path.basename(os.path.normpath(CROPPED_OUTPUT_DIR)),
 }
 
 
@@ -539,9 +547,25 @@ MENU = """
  5) Hard-link compiled PDFs into ./pdf
  6) One click: Index -> Build PDFs -> Hard Link
  7) Sort files into month folders (by date in filename)
+ 8) Group similar images (perceptual hash, offline)
+ 9) Auto-crop document photos into ./auto_cropped
+10) Crop feedback: teach the cropper what worked
+11) Show learned settings / reset learning
  0) Exit
 ========================================================
 """
+
+
+def _image_tools():
+    """Import the image module lazily so a missing optional package never
+    breaks the rest of the menu."""
+    try:
+        import image_tools
+    except ImportError as e:
+        print(f"  [Error] Image features need extra packages: {e}")
+        print("  Install them with: uv sync\n")
+        return None
+    return image_tools
 
 
 def main():
@@ -570,6 +594,22 @@ def main():
             run_full_pipeline()
         elif choice == "7":
             sort_files_into_month_folders()
+        elif choice == "8":
+            tools = _image_tools()
+            if tools:
+                tools.group_similar_images()
+        elif choice == "9":
+            tools = _image_tools()
+            if tools:
+                tools.auto_crop_images()
+        elif choice == "10":
+            tools = _image_tools()
+            if tools:
+                tools.crop_feedback()
+        elif choice == "11":
+            tools = _image_tools()
+            if tools:
+                tools.learning_status()
         elif choice == "0":
             print("Goodbye!")
             break

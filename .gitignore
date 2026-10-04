@@ -7,3 +7,10 @@ __pycache__/
 files.db
 export_output/
 pdf/
+
+# Image-feature runtime output
+similar_review/
+auto_cropped/
+
+# ZCode workspace metadata
+.zcode/

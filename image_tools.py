@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+"""Local, free image intelligence for the file toolkit: perceptual-hash
+similarity grouping, automatic document cropping, and a self-learning loop.
+
+Everything runs offline — no cloud, no LLM, no downloaded models. The
+"learning" is feedback-driven: your answers about groups and crops are kept
+in the toolkit database and gently adjust the parameters used next time.
+
+Imported lazily by file_toolkit.py, so it reaches back into it for the
+shared config, prompts and helpers.
+"""
+
+import os
+import shutil
+import sqlite3
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+
+import imagehash
+import numpy as np
+from PIL import Image, ImageOps
+
+import file_toolkit as tk
+
+
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff'}
+
+# Learnable parameters: defaults, and the range the feedback loop may move
+# them into. Keys live in the learning_state table; anything absent simply
+# uses the default.
+DEFAULT_PARAMS = {
+    "similarity_threshold": 10,   # max pHash hamming distance (/64) = similar
+    "crop_margin": 12,            # pixels of padding kept around the content
+    "crop_tolerance": 28,         # how far a pixel may differ from the border
+                                  # colour before it counts as content
+    "crop_min_gain": 5.0,         # skip cropping if it frees less than this %
+}
+PARAM_BOUNDS = {
+    "similarity_threshold": (4, 20),
+    "crop_margin": (0, 120),
+    "crop_tolerance": (5, 90),
+    "crop_min_gain": (1.0, 30.0),
+}
+
+
+# ==========================================================================
+# 1) Database: hash cache + learning state
+# ==========================================================================
+def _open_db():
+    conn = sqlite3.connect(tk.DB_NAME)
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS image_hashes (
+            full_path TEXT PRIMARY KEY,
+            mtime REAL NOT NULL,
+            phash TEXT NOT NULL,
+            dhash TEXT NOT NULL
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS learning_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS feedback_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            old_value TEXT,
+            new_value TEXT
+        )
+    ''')
+    conn.commit()
+    return conn
+
+
+def _clamp(key, value):
+    low, high = PARAM_BOUNDS[key]
+    return max(low, min(high, value))
+
+
+def get_param(conn, key):
+    """Learned value for `key`, or the built-in default."""
+    default = DEFAULT_PARAMS[key]
+    row = conn.execute(
+        "SELECT value FROM learning_state WHERE key = ?", (key,)
+    ).fetchone()
+    if row is None:
+        return default
+    try:
+        return type(default)(row[0])
+    except (TypeError, ValueError):
+        return default
+
+
+def set_param(conn, key, new_value, kind, detail):
+    """Persist a learned parameter and record why it changed."""
+    old_value = get_param(conn, key)
+    if new_value == old_value:
+        return old_value
+    conn.execute(
+        "INSERT OR REPLACE INTO learning_state (key, value) VALUES (?, ?)",
+        (key, str(new_value)),
+    )
+    conn.execute(
+        "INSERT INTO feedback_log (ts, kind, detail, old_value, new_value) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (datetime.now().isoformat(timespec="seconds"), kind, detail,
+         str(old_value), str(new_value)),
+    )
+    conn.commit()
+    print(f"  [Learned] {key}: {old_value} -> {new_value} ({detail})")
+    return old_value
+
+
+def reset_learning(conn):
+    """Forget every learned parameter (the feedback history is kept)."""
+    conn.execute("DELETE FROM learning_state")
+    conn.commit()
+
+
+# ==========================================================================
+# 2) Image collection + perceptual hashing (cached)
+# ==========================================================================
+def collect_image_files(target_dir, recursive=True):
+    """Every image under `target_dir`, skipping hidden files, the toolkit's
+    own output folders and — when not recursive — subfolders entirely."""
+    target_dir = Path(target_dir)
+    files = []
+    if recursive:
+        for root, dirs, names in os.walk(target_dir):
+            dirs[:] = [d for d in dirs
+                       if not d.startswith(".") and d not in tk.OUTPUT_DIR_NAMES]
+            for name in names:
+                if name.startswith("."):
+                    continue
+                if os.path.splitext(name)[1].lower() in IMAGE_EXTENSIONS:
+                    files.append(Path(root) / name)
+    else:
+        for entry in target_dir.iterdir():
+            if (entry.is_file() and not entry.name.startswith(".")
+                    and entry.suffix.lower() in IMAGE_EXTENSIONS):
+                files.append(entry)
+    return sorted(files)
+
+
+def _compute_hashes(path):
+    with Image.open(path) as img:
+        img = ImageOps.exif_transpose(img)
+        return imagehash.phash(img), imagehash.dhash(img)
+
+
+def hashes_for_files(conn, files):
+    """Map each usable file path to (phash, dhash), recomputing only images
+    whose mtime changed since the last run."""
+    cache = {
+        row[0]: (row[1], row[2], row[3])
+        for row in conn.execute(
+            "SELECT full_path, mtime, phash, dhash FROM image_hashes")
+    }
+    hashes = {}
+    fresh_rows = []
+    for path in files:
+        try:
+            mtime = path.stat().st_mtime
+        except OSError as e:
+            print(f"  [Skipped] {path.name}: {e}")
+            continue
+        cached = cache.get(str(path))
+        if cached and abs(cached[0] - mtime) < 1e-6:
+            hashes[str(path)] = (
+                imagehash.hex_to_hash(cached[1]),
+                imagehash.hex_to_hash(cached[2]),
+            )
+            continue
+        try:
+            phash, dhash = _compute_hashes(path)
+        except Exception as e:
+            print(f"  [Skipped] {path.name}: unreadable image ({e})")
+            continue
+        hashes[str(path)] = (phash, dhash)
+        fresh_rows.append((str(path), mtime, str(phash), str(dhash)))
+
+    if fresh_rows:
+        conn.executemany(
+            "INSERT OR REPLACE INTO image_hashes "
+            "(full_path, mtime, phash, dhash) VALUES (?, ?, ?, ?)",
+            fresh_rows,
+        )
+        conn.commit()
+    return hashes
+
+
+# ==========================================================================
+# 3) Similar-image clustering
+# ==========================================================================
+def _split_chains(group, hashes, threshold):
+    """Union-find can chain A~B~C even when A and C look nothing alike, which
+    matters for screenshots sharing one layout. Split a chained group
+    greedily so every member ends up within `threshold` of ALL other members
+    of its sub-cluster (complete-link criterion)."""
+    if len(group) == 2:
+        return [list(group)]
+    clusters = []
+    for path in group:
+        for cluster in clusters:
+            if all(hashes[path][0] - hashes[other][0] <= threshold
+                   for other in cluster):
+                cluster.append(path)
+                break
+        else:
+            clusters.append([path])
+    return clusters
+
+
+def cluster_by_similarity(hashes, threshold):
+    """Group paths whose pHash hamming distance is <= `threshold` (union-find,
+    then chained groups are split so every pair inside a cluster is truly
+    similar). Returns a list of (members, max_pair_distance) tuples sorted by
+    first member path."""
+    paths = list(hashes)
+    parent = {p: p for p in paths}
+
+    def find(p):
+        while parent[p] != p:
+            parent[p] = parent[parent[p]]
+            p = parent[p]
+        return p
+
+    for i in range(len(paths)):
+        for j in range(i + 1, len(paths)):
+            a, b = paths[i], paths[j]
+            if hashes[a][0] - hashes[b][0] <= threshold:
+                parent[find(a)] = find(b)
+
+    groups = defaultdict(list)
+    for p in paths:
+        groups[find(p)].append(p)
+
+    result = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        members.sort()
+        for cluster in _split_chains(members, hashes, threshold):
+            if len(cluster) < 2:
+                continue
+            spread = max(
+                hashes[a][0] - hashes[b][0]
+                for idx, a in enumerate(cluster)
+                for b in cluster[idx + 1:]
+            )
+            result.append((cluster, spread))
+    result.sort(key=lambda item: item[0][0])
+    return result
+
+
+def _adjust_threshold(conn, confirmed, spread, detail):
+    """One feedback step for the similarity threshold.
+
+    A rejected group means the threshold let too-distant images together, so
+    it drops to just under that group's spread. A confirmed group that sat
+    right at the threshold nudges it up — borderline pairs were judged
+    genuinely similar, so slightly more distant ones may be worth catching."""
+    key = "similarity_threshold"
+    threshold = get_param(conn, key)
+    low, high = PARAM_BOUNDS[key]
+    if confirmed:
+        if spread < threshold - 2:
+            return                      # comfortably inside; nothing to learn
+        new_value = min(high, threshold + 1)
+    else:
+        new_value = min(threshold - 1, max(low, spread - 2))
+        new_value = max(low, new_value)
+    set_param(conn, key, new_value,
+              "similar_yes" if confirmed else "similar_no", detail)
+
+
+def group_similar_images():
+    """Menu action: find clusters of perceptually similar images and, per
+    cluster, move them to the review folder or teach the threshold."""
+    print("Finds groups of similar images via perceptual hashing (offline).")
+    print("Nothing is deleted — grouped images go to a review folder.\n")
+
+    conn = _open_db()
+    try:
+        threshold = get_param(conn, "similarity_threshold")
+        files = collect_image_files(tk.TARGET_DIR)
+        if not files:
+            print("No images found in the working folder.\n")
+            return
+
+        print(f"Hashing {len(files)} image(s); cached hashes are reused...")
+        hashes = hashes_for_files(conn, files)
+        groups = cluster_by_similarity(hashes, threshold)
+        if not groups:
+            print(f"No similar images found (threshold {threshold}).\n")
+            return
+
+        print(f"\nFound {len(groups)} group(s) of similar images "
+              f"(threshold {threshold}).")
+        review_root = Path(tk.SIMILAR_REVIEW_DIR)
+        existing = [p for p in review_root.glob("group_*") if p.is_dir()] \
+            if review_root.is_dir() else []
+        next_group = len(existing) + 1
+        moved_total = groups_handled = 0
+
+        for members, spread in groups:
+            groups_handled += 1
+            print(f"\nGroup {groups_handled}/{len(groups)} "
+                  f"— {len(members)} image(s), spread {spread}:")
+            first = members[0]
+            for member in members:
+                distance = hashes[first][0] - hashes[member][0]
+                print(f"    {member}  (d={distance})")
+
+            answer = tk.ask(
+                "  (m)ove group to review folder / (k)eep / "
+                "(n)ot similar / (q)uit: ")
+            if answer is None:
+                print("  [Cancelled]\n")
+                break
+            answer = answer.strip().lower()
+
+            if answer == "q":
+                break
+            if answer == "n":
+                _adjust_threshold(conn, confirmed=False, spread=spread,
+                                  detail="group marked not similar")
+                continue
+            if answer in ("m", "k"):
+                confirmed = True
+            else:
+                print("  [Skipped] Unrecognised answer.\n")
+                continue
+
+            if answer == "m":
+                dest_dir = review_root / f"group_{next_group:02d}"
+                next_group += 1
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                moved = 0
+                for member in members:
+                    try:
+                        destination = tk.unique_destination(
+                            dest_dir, Path(member).name)
+                        shutil.move(member, str(destination))
+                        conn.execute(
+                            "DELETE FROM image_hashes WHERE full_path = ?",
+                            (member,))
+                        moved += 1
+                    except Exception as e:
+                        print(f"  [Error] Failed to move {member}: {e}")
+                conn.commit()
+                moved_total += moved
+                print(f"  Moved {moved} image(s) to {dest_dir}")
+            _adjust_threshold(conn, confirmed=True, spread=spread,
+                              detail="group confirmed as similar")
+
+        print(f"\nDone! {moved_total} image(s) moved to "
+              f"'{tk.SIMILAR_REVIEW_DIR}' for review.\n")
+    finally:
+        conn.close()
+
+
+# ==========================================================================
+# 4) Automatic document cropping
+# ==========================================================================
+def _content_bbox(arr, tolerance):
+    """Bounding box (left, top, right, bottom) of everything that differs
+    from the border colour, ignoring sparse noise rows/columns. Returns None
+    when the image looks uniformly one colour."""
+    height, width, _ = arr.shape
+    frame = max(2, min(height, width) // 50)
+    samples = np.concatenate([
+        arr[:frame].reshape(-1, 3),
+        arr[-frame:].reshape(-1, 3),
+        arr[:, :frame].reshape(-1, 3),
+        arr[:, -frame:].reshape(-1, 3),
+    ])
+    background = np.median(samples, axis=0)
+
+    diff = np.abs(arr - background).max(axis=2)
+    mask = diff > tolerance
+    if not mask.any():
+        return None
+
+    # A row/column counts as content only if enough of it differs from the
+    # background — filters dust specks and sensor noise.
+    row_cut = max(3, int(width * 0.005))
+    col_cut = max(3, int(height * 0.005))
+    rows = np.where(mask.sum(axis=1) > row_cut)[0]
+    cols = np.where(mask.sum(axis=0) > col_cut)[0]
+    if rows.size == 0 or cols.size == 0:
+        return None
+    return int(cols[0]), int(rows[0]), int(cols[-1]) + 1, int(rows[-1]) + 1
+
+
+def compute_crop(img, margin, tolerance):
+    """Crop box around the document in `img`, or (None, reason) when there
+    is nothing worth cutting. `img` must already be orientation-corrected."""
+    arr = np.asarray(img.convert("RGB"), dtype=np.int16)
+    bbox = _content_bbox(arr, tolerance)
+    if bbox is None:
+        return None, "image looks uniformly one colour"
+    left, top, right, bottom = bbox
+    left = max(0, left - margin)
+    top = max(0, top - margin)
+    right = min(img.width, right + margin)
+    bottom = min(img.height, bottom + margin)
+    return (left, top, right, bottom), None
+
+
+def auto_crop_images():
+    """Menu action: trim the background around every document photo. The
+    originals are never touched — results go to the auto_cropped folder."""
+    print("Cuts the background off document photos and saves the result in")
+    print(f"'{tk.CROPPED_OUTPUT_DIR}' — original files are never modified.\n")
+
+    answer = tk.ask("Scan subfolders too? (Y/n): ")
+    if answer is None:
+        print("  [Cancelled]\n")
+        return
+    recursive = answer.strip().lower() not in ("n", "no")
+
+    files = collect_image_files(tk.TARGET_DIR, recursive=recursive)
+    if not files:
+        print("No images found in the working folder.\n")
+        return
+
+    conn = _open_db()
+    try:
+        margin = get_param(conn, "crop_margin")
+        tolerance = get_param(conn, "crop_tolerance")
+        min_gain = get_param(conn, "crop_min_gain")
+        print(f"Using learned settings: margin {margin}px, "
+              f"tolerance {tolerance}, min gain {min_gain}%.\n")
+
+        out_root = Path(tk.CROPPED_OUTPUT_DIR)
+        cropped = skipped = failed = 0
+        for path in files:
+            try:
+                rel = path.relative_to(tk.TARGET_DIR)
+            except ValueError:
+                rel = Path(path.name)
+            destination = tk.unique_destination(out_root / rel.parent,
+                                                rel.name)
+            try:
+                with Image.open(path) as img:
+                    img = ImageOps.exif_transpose(img)
+                    box, reason = compute_crop(img, margin, tolerance)
+                    if box is None:
+                        print(f"  [Skipped] {rel}: {reason}")
+                        skipped += 1
+                        continue
+                    left, top, right, bottom = box
+                    old_area = img.width * img.height
+                    new_area = (right - left) * (bottom - top)
+                    gain = (old_area - new_area) / old_area * 100
+                    if gain < min_gain:
+                        print(f"  [Skipped] {rel}: already tight "
+                              f"(cropping would free only {gain:.1f}%)")
+                        skipped += 1
+                        continue
+
+                    cropped_img = img.crop(box)
+                    save_kwargs = {}
+                    if destination.suffix.lower() in (".jpg", ".jpeg"):
+                        save_kwargs = {"quality": 95}
+                        if "exif" in img.info:
+                            save_kwargs["exif"] = img.info["exif"]
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    cropped_img.save(destination, **save_kwargs)
+                    print(f"  {rel}: {img.width}x{img.height} -> "
+                          f"{cropped_img.width}x{cropped_img.height} "
+                          f"(freed {gain:.0f}%)")
+                    cropped += 1
+            except Exception as e:
+                print(f"  [Error] Failed to crop {rel}: {e}")
+                failed += 1
+
+        print(f"\nDone! {cropped} image(s) cropped, {skipped} skipped, "
+              f"{failed} failed. Results are in '{tk.CROPPED_OUTPUT_DIR}'.")
+        print("Review them, then use the crop feedback option to teach the")
+        print("cropper what 'good' looks like.\n")
+    finally:
+        conn.close()
+
+
+def crop_feedback():
+    """Menu action: teach the cropper from what you saw in auto_cropped/."""
+    print("Answer based on the results you reviewed in "
+          f"'{tk.CROPPED_OUTPUT_DIR}':")
+    print(" 1) Crops cut off some content (too tight)")
+    print(" 2) Crops left too much background (too loose)")
+    print(" 3) Crops look good")
+    answer = tk.ask("Select 1/2/3: ")
+    if answer is None:
+        print("  [Cancelled]\n")
+        return
+    answer = answer.strip()
+
+    conn = _open_db()
+    try:
+        if answer == "1":
+            # Keep more padding and let dimmer pixels (shadows, page edges)
+            # count as content.
+            margin = _clamp("crop_margin",
+                            get_param(conn, "crop_margin") + 4)
+            tolerance = _clamp("crop_tolerance",
+                               get_param(conn, "crop_tolerance") - 4)
+            set_param(conn, "crop_margin", margin, "crop_too_tight",
+                      "crops were cutting off content")
+            set_param(conn, "crop_tolerance", tolerance, "crop_too_tight",
+                      "crops were cutting off content")
+        elif answer == "2":
+            margin = _clamp("crop_margin",
+                            get_param(conn, "crop_margin") - 4)
+            tolerance = _clamp("crop_tolerance",
+                               get_param(conn, "crop_tolerance") + 4)
+            set_param(conn, "crop_margin", margin, "crop_too_loose",
+                      "crops left background in")
+            set_param(conn, "crop_tolerance", tolerance, "crop_too_loose",
+                      "crops left background in")
+        elif answer == "3":
+            conn.execute(
+                "INSERT INTO feedback_log (ts, kind, detail) "
+                "VALUES (?, 'crop_good', 'user approved the crops')",
+                (datetime.now().isoformat(timespec="seconds"),),
+            )
+            conn.commit()
+            print("  [Learned] Thanks — settings stay as they are.")
+        else:
+            print("  [Cancelled] Invalid choice.\n")
+            return
+        print()
+    finally:
+        conn.close()
+
+
+# ==========================================================================
+# 5) Learning status
+# ==========================================================================
+def learning_status():
+    """Menu action: show what the toolkit has learned and optionally reset."""
+    conn = _open_db()
+    try:
+        print("Learned parameters (used value; * = still at default):")
+        for key, default in DEFAULT_PARAMS.items():
+            value = get_param(conn, key)
+            marker = "" if value != default else " *"
+            bounds = PARAM_BOUNDS[key]
+            print(f"  {key:<22} {value}{marker}   (allowed {bounds[0]}..{bounds[1]})")
+
+        counts = conn.execute(
+            "SELECT kind, COUNT(*) FROM feedback_log GROUP BY kind "
+            "ORDER BY kind").fetchall()
+        total = sum(count for _, count in counts)
+        print(f"\nFeedback recorded so far: {total} note(s).")
+        for kind, count in counts:
+            print(f"  {kind:<16} {count}")
+
+        answer = tk.ask("\nReset all learned parameters to defaults? (y/N): ")
+        if answer is None:
+            return
+        if answer.strip().lower() in ("y", "yes"):
+            reset_learning(conn)
+            print("Learned parameters reset — feedback history kept.\n")
+        else:
+            print("Kept as they are.\n")
+    finally:
+        conn.close()
