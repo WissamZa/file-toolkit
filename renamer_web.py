@@ -17,6 +17,7 @@ identical. Serves from 127.0.0.1 only; nothing leaves the machine.
 
 import json
 import os
+import re
 import threading
 import webbrowser
 from datetime import datetime
@@ -107,6 +108,44 @@ def _rel(path):
         return str(Path(path).relative_to(SESSION.get("folder") or path))
     except ValueError:
         return str(path)
+
+
+EXIF_TOKEN_RE = re.compile(r"\{exif_date(?::([^{}]*))?\}", re.IGNORECASE)
+
+
+def _exif_date(path, fmt="%Y-%m-%d"):
+    """EXIF capture date formatted with `fmt`, or None when the file has
+    no EXIF date (never falls back to the mtime)."""
+    try:
+        with Image.open(path) as img:
+            exif = img.getexif()
+            dt = None
+            try:
+                dt = exif.get_ifd(0x8769).get(36867)   # DateTimeOriginal
+            except (AttributeError, KeyError):
+                pass
+            if not dt:
+                dt = exif.get(306)                     # DateTime
+            if dt:
+                return datetime.strptime(str(dt).strip(),
+                                         "%Y:%m:%d %H:%M:%S").strftime(fmt)
+    except Exception:
+        pass
+    return None
+
+
+def _expand_exif_token(path, tpl):
+    """Replace {exif_date[:fmt]} in the template with the file's real
+    capture date. Returns (template, error)."""
+    def sub(m):
+        value = _exif_date(path, m.group(1) or "%Y-%m-%d")
+        if value is None:
+            raise ValueError("no EXIF date")
+        return value
+    try:
+        return EXIF_TOKEN_RE.sub(sub, tpl), None
+    except ValueError:
+        return tpl, "لا يحتوي هذا الملف تاريخ تصوير EXIF — استخدم {mtime}"
 
 
 def _image_bytes(path, max_px):
@@ -283,16 +322,20 @@ class Handler(BaseHTTPRequestHandler):
             if not _under_session(path):
                 self._json(403, {"error": "مسار غير مسموح"})
                 return
+            tpl, exif_err = _expand_exif_token(path, data.get("tpl", ""))
             new, err = qr.make_plan(
                 path,
                 typed=data.get("typed", ""),
-                tpl=data.get("tpl", ""),
+                tpl=tpl,
                 ext_raw=data.get("ext") or qr.KEEP,
                 find=data.get("find", ""),
                 repl=data.get("repl", ""),
                 icase=bool(data.get("icase")),
                 counter=int(data.get("counter") or 1),
             )
+            err = exif_err or err
+            if exif_err:
+                new = None
             self._json(200, {
                 "new": new, "err": err,
                 "same": new == path or (new is None and err is None),
@@ -356,11 +399,15 @@ class Handler(BaseHTTPRequestHandler):
             rows = []
             counter = int(data.get("counter") or 1)
             for path in files:
+                tpl, exif_err = _expand_exif_token(path, data.get("tpl", ""))
                 new, err = qr.make_plan(
-                    path, typed=data.get("typed", ""), tpl=data.get("tpl", ""),
+                    path, typed=data.get("typed", ""), tpl=tpl,
                     ext_raw=data.get("ext") or qr.KEEP,
                     find=data.get("find", ""), repl=data.get("repl", ""),
                     icase=bool(data.get("icase")), counter=counter)
+                err = exif_err or err
+                if exif_err:
+                    new = None
                 uses_n = any((m.group("tok") or "").lower() == "n"
                              for m in qr.TPL_RE.finditer(data.get("tpl", "")))
                 if err is None and new is not None and new != path:
@@ -730,6 +777,7 @@ table.help td { padding:6px 8px; border-bottom:1px solid var(--border); font-siz
       <tr><td class="ltr">{n} / {n:03}</td><td>العدّاد التلقائي — :03 يعني ثلاث خانات (001)</td></tr>
       <tr><td class="ltr">{date}</td><td>تاريخ اليوم — بتنسيق مثل {date:%m-%Y}</td></tr>
       <tr><td class="ltr">{mtime}</td><td>تاريخ آخر تعديل للملف — مثل {mtime:%d-%m-%Y}</td></tr>
+      <tr><td class="ltr">{exif_date}</td><td>تاريخ التصوير من EXIF (وليس تاريخ التعديل) — مثل {exif_date:%d-%m-%Y}. مثالي لصور الواتساب</td></tr>
     </table>
     <div class="muted" style="margin-top:10px; line-height:1.9;">
       الـRegex يُطبَّق على الاسم الحالي قبل القالب (يؤثر في {orig}).<br>
