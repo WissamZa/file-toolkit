@@ -34,6 +34,37 @@ import quick_renamer as qr
 UNDO_STACK = []            # [(log_id, new_path, old_path)] — session only
 SESSION = {"folder": None}  # folder the file list came from
 LAST_BATCH = {"run_id": None}  # most recent batch rename, for bulk undo
+SESSION["hashes"] = None       # lazy {path: phash} map for dup warnings
+
+
+def _session_hashes(conn):
+    """Perceptual hashes for every image in the opened folder, computed on
+    first use and kept until the folder changes or files are renamed."""
+    if SESSION.get("hashes") is None:
+        files = [p for p in _list_files(SESSION["folder"],
+                                        SESSION.get("sub", False))
+                 if os.path.splitext(p)[1].lower() in it.IMAGE_EXTENSIONS]
+        SESSION["hashes"] = it.hashes_for_files(
+            conn, [Path(p) for p in files])
+    return SESSION["hashes"]
+
+
+def _find_duplicate(conn, path):
+    """Closest perceptually-similar *other* image within the learned
+    similarity threshold. Returns (other_path, distance) or None."""
+    hashes = _session_hashes(conn)
+    mine = hashes.get(str(path))
+    if mine is None:
+        return None
+    threshold = it.get_param(conn, "similarity_threshold")
+    best, best_d = None, None
+    for other, h in hashes.items():
+        if other == str(path):
+            continue
+        d = mine[0] - h[0]
+        if d <= threshold and (best_d is None or d < best_d):
+            best, best_d = other, d
+    return (best, int(best_d)) if best else None
 
 
 # --------------------------------------------------------------------------
@@ -148,6 +179,13 @@ def _expand_exif_token(path, tpl):
         return tpl, "لا يحتوي هذا الملف تاريخ تصوير EXIF — استخدم {mtime}"
 
 
+def _move_hash(old, new):
+    """Keep the session hash map consistent across renames."""
+    hashes = SESSION.get("hashes")
+    if hashes and str(old) in hashes:
+        hashes[str(new)] = hashes.pop(str(old))
+
+
 def _image_bytes(path, max_px):
     with Image.open(path) as img:
         img = ImageOps.exif_transpose(img).convert("RGB")
@@ -253,6 +291,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             SESSION["folder"] = folder
             SESSION["sub"] = include_sub
+            SESSION["hashes"] = None
             UNDO_STACK.clear()
             files = [f for f in (_file_payload(p)
                                  for p in _list_files(folder, include_sub))
@@ -336,10 +375,18 @@ class Handler(BaseHTTPRequestHandler):
             err = exif_err or err
             if exif_err:
                 new = None
+            conn = it._open_db()
+            try:
+                dup = _find_duplicate(conn, path) if not err else None
+            finally:
+                conn.close()
             self._json(200, {
                 "new": new, "err": err,
                 "same": new == path or (new is None and err is None),
                 "conflict": bool(new) and qr.conflicts(new, path),
+                "dup": {"path": dup[0],
+                        "name": os.path.basename(dup[0]),
+                        "distance": dup[1]} if dup else None,
             })
         elif route == "/api/commit":
             path = data.get("path", "")
@@ -386,6 +433,7 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as e:
                     print(f"  [Renamer] operation log failed: {e}")
                 UNDO_STACK.append((log_id, new, path))
+                _move_hash(path, new)
                 SESSION["folder"] = os.path.dirname(new)
                 msgs.append(f"أُعيدت التسمية إلى {os.path.basename(new)}")
             self._json(200, {"ok": True, "log_id": log_id,
@@ -459,6 +507,7 @@ class Handler(BaseHTTPRequestHandler):
                             "SELECT last_insert_rowid()").fetchone()[0]
                         conn.commit()
                         UNDO_STACK.append((log_id, new, path))
+                        _move_hash(path, new)
                         done += 1
                     except Exception:
                         failed += 1
@@ -488,6 +537,7 @@ class Handler(BaseHTTPRequestHandler):
                             if os.path.exists(source):
                                 target = qr.unique_path(source)
                             os.rename(destination, target)
+                            _move_hash(destination, target)
                         conn.execute("DELETE FROM operation_log WHERE id = ?",
                                      (log_id,))
                         reverted_ids.append(log_id)
@@ -510,6 +560,7 @@ class Handler(BaseHTTPRequestHandler):
             log_id, new_path, old_path = UNDO_STACK.pop()
             try:
                 os.rename(new_path, old_path)
+                _move_hash(new_path, old_path)
             except Exception as e:
                 self._json(500, {"error": f"فشل التراجع: {e}"})
                 return
@@ -681,6 +732,9 @@ table.help td { padding:6px 8px; border-bottom:1px solid var(--border); font-siz
         <label class="fld">الاسم الجديد — اكتب النص مكان xx</label>
         <input type="text" id="typed" placeholder="اكتب هنا… (Enter فارغ = تخطي)">
         <div id="preview-line"></div>
+        <div id="dup-warning" style="display:none; margin-top:6px; padding:7px 12px;
+             border-radius:9px; font-size:12.5px; font-weight:700;
+             background:var(--warn); color:#10131a;"></div>
         <label class="fld">القالب</label>
         <div class="row" style="flex-wrap:nowrap;">
           <input type="text" id="tpl" list="tpl-list" class="ltr" style="flex:1;">
@@ -928,6 +982,11 @@ function refreshPreview() {
     try {
       const d = await api('/api/plan', planInput());
       PENDING_PLAN = d;
+      const dw = $('dup-warning');
+      if (d.dup && !d.same) {
+        dw.style.display = 'block';
+        dw.textContent = `⚠ تحذير تكرار: هذه الصورة تشبه «${d.dup.name}» بصرياً (بعد ${d.dup.distance}) — تأكد قبل التسمية`;
+      } else { dw.style.display = 'none'; }
       if (d.err) { line.className = 'err'; line.textContent = '✗ ' + d.err; }
       else if (d.same) { line.className = 'same'; line.textContent = '— لا تغيير (سيتم التخطي)'; }
       else {
