@@ -284,6 +284,26 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(500, {"error": str(e)})
                 return
             self._json(200, {"folder": folder, "subdirs": dirs})
+        elif route == "/api/browse":
+            """Directory listing for the folder-picker modal."""
+            path = os.path.abspath(unquote((query.get("path") or [""])[0])
+                                   or str(Path.home()))
+            if not os.path.isdir(path):
+                path = str(Path.home())
+            try:
+                dirs = sorted(
+                    (d for d in os.listdir(path)
+                     if os.path.isdir(os.path.join(path, d))
+                     and not d.startswith(".")),
+                    key=qr.natural_key)
+            except OSError as e:
+                self._json(500, {"error": str(e)})
+                return
+            parent = os.path.dirname(path)
+            self._json(200, {
+                "path": path,
+                "parent": parent if parent != path else None,
+                "dirs": dirs})
         elif route == "/api/list":
             folder = os.path.abspath(unquote((query.get("folder") or [""])[0]))
             include_sub = (query.get("sub") or ["0"])[0] == "1"
@@ -679,7 +699,7 @@ h1 .logo { width:32px; height:32px; border-radius:9px; display:grid; place-items
   background:linear-gradient(135deg,var(--accent),#7c5cff); font-size:16px; }
 .muted { color:var(--muted); font-size:12.5px; }
 .ltr { direction:ltr; unicode-bidi:isolate; }
-main { padding:16px 26px 60px; max-width:1320px; margin:0 auto; }
+main { padding:16px 28px 70px; }
 .card { background:var(--surface); border:1px solid var(--border);
   border-radius:14px; padding:14px 16px; margin-bottom:12px; }
 .btn { border:1px solid var(--border); border-radius:9px; padding:9px 16px;
@@ -772,7 +792,8 @@ table.help td { padding:6px 8px; border-bottom:1px solid var(--border); font-siz
     <div class="row">
       <span class="muted">المجلد:</span>
       <input type="text" id="folder" style="flex:1; min-width:220px" class="ltr">
-      <button class="btn primary" onclick="openFolder()">📂 فتح</button>
+      <button class="btn primary" onclick="openBrowser()">📂 اختيار مجلد…</button>
+      <button class="btn" onclick="openFolder()" title="فتح المسار المكتوب أعلاه">فتح المسار</button>
       <label class="row" style="gap:5px; cursor:pointer; font-size:13px;">
         <input type="checkbox" id="sub-chk"> تضمين المجلدات الفرعية
       </label>
@@ -889,6 +910,24 @@ table.help td { padding:6px 8px; border-bottom:1px solid var(--border); font-siz
       <button class="btn ok" onclick="resolveConflict('keep')">إبقاء الاثنين (اسم جديد تلقائي)</button>
       <button class="btn bad" onclick="resolveConflict('overwrite')">استبدال الموجود (لا يمكن التراجع)</button>
       <button class="btn" onclick="resolveConflict('cancel')">إلغاء</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-bg" id="browse-modal">
+  <div class="modal">
+    <h3>📂 اختر مجلداً</h3>
+    <div class="row" style="margin-bottom:10px;">
+      <span class="muted">المسار الحالي:</span>
+      <span id="browse-path" class="ltr" style="font-weight:700; word-break:break-all;"></span>
+    </div>
+    <div id="browse-list" style="max-height:46vh; overflow-y:auto;
+         border:1px solid var(--border); border-radius:10px; padding:8px;"></div>
+    <div class="actions">
+      <button class="btn" onclick="browseUp()">⬆️ للمجلد الأعلى</button>
+      <span class="spacer"></span>
+      <button class="btn primary" onclick="browseSelect()">✓ فتح هذا المجلد</button>
+      <button class="btn" onclick="hide('browse-modal')">إلغاء</button>
     </div>
   </div>
 </div>
@@ -1196,6 +1235,51 @@ async function commit(f, new_name, overwrite, keep_both) {
     if (IDX + 1 < FILES.length) load(IDX + 1);
     else { toast('انتهت قائمة الملفات ✓'); $('preview-line').textContent = ''; }
   } catch (e) { toast('خطأ: ' + e.message); }
+}
+
+/* ---------- folder picker ---------- */
+let BROWSE_PATH = '';
+async function openBrowser() {
+  $('browse-modal').classList.add('show');
+  await browseTo($('folder').value.trim() || '');
+}
+async function browseTo(p) {
+  try {
+    const d = await api('/api/browse?path=' + encodeURIComponent(p));
+    BROWSE_PATH = d.path;
+    $('browse-path').textContent = d.path;
+    const list = $('browse-list');
+    list.innerHTML = '';
+    if (d.parent) {
+      const up = document.createElement('div');
+      up.className = 'chip';
+      up.textContent = '⬆️ .. (المجلد الأعلى)';
+      up.style.width = '100%';
+      up.onclick = () => browseTo(d.parent);
+      list.appendChild(up);
+    }
+    for (const dir of d.dirs) {
+      const item = document.createElement('div');
+      item.className = 'chip ltr';
+      item.style.width = '100%';
+      item.textContent = '📁 ' + dir;
+      item.onclick = () => browseTo(
+        BROWSE_PATH.endsWith('/') ? BROWSE_PATH + dir
+                                  : BROWSE_PATH + '/' + dir);
+      list.appendChild(item);
+    }
+    if (!list.children.length)
+      list.innerHTML = '<div class="empty">لا توجد مجلدات فرعية هنا</div>';
+  } catch (e) { toast('خطأ: ' + e.message); }
+}
+function browseUp() {
+  const p = $('browse-path').textContent;
+  browseTo(p.slice(0, p.lastIndexOf('/')) || '/');
+}
+function browseSelect() {
+  hide('browse-modal');
+  $('folder').value = BROWSE_PATH;
+  openFolder();
 }
 
 /* ---------- batch rename ---------- */
