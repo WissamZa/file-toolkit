@@ -389,6 +389,43 @@ class Handler(BaseHTTPRequestHandler):
                     cfg[key] = data[key]
             _save_config(cfg)
             self._json(200, {"ok": True})
+        elif route == "/api/meta_batch":
+            """Apply the given (non-empty) field values to every file in the
+            opened folder, respecting each file's supported metadata keys.
+            Existing values for other fields are left untouched."""
+            values = data.get("values") or {}
+            filled = {k: v for k, v in values.items() if (v or "").strip()}
+            if not filled:
+                self._json(400, {"error": "لا حقول معبأة للتطبيق"})
+                return
+            if not SESSION.get("folder"):
+                self._json(400, {"error": "افتح مجلداً أولاً"})
+                return
+            files = _list_files(SESSION["folder"], SESSION.get("sub", False))
+            done = skipped = failed = 0
+            errors = []
+            for path in files:
+                try:
+                    vals, keys = qr.read_meta(path)
+                    if not keys:
+                        skipped += 1
+                        continue
+                    merged = {k: vals.get(k, "") for k in keys}
+                    touched = False
+                    for k, v in filled.items():
+                        if k in keys and merged.get(k, "") != v:
+                            merged[k] = v
+                            touched = True
+                    if touched:
+                        qr.write_meta(path, merged)
+                        done += 1
+                    else:
+                        skipped += 1
+                except Exception as e:
+                    failed += 1
+                    errors.append(f"{os.path.basename(path)}: {e}")
+            self._json(200, {"done": done, "skipped": skipped,
+                             "failed": failed, "errors": errors[:5]})
         elif route == "/api/plan":
             path = data.get("path", "")
             if not _under_session(path):
@@ -833,6 +870,10 @@ table.help td { padding:6px 8px; border-bottom:1px solid var(--border); font-siz
         <div style="font-weight:800; margin-bottom:4px;">البيانات الوصفية</div>
         <div id="meta-note" class="muted" style="font-size:12.5px;"></div>
         <div id="meta-fields"></div>
+        <button class="btn" style="width:100%; margin-top:10px;" id="meta-batch-btn"
+                onclick="applyMetaBatch()">📦 تطبيق الحقول المعبأة على كل الملفات</button>
+        <div class="muted" style="margin-top:6px; font-size:11.5px;">
+          يُطبَّق كل حقل معبأ على الملفات التي تدعمه (فارغ = لا يُلمس). لا يمكن التراجع عن هذا.</div>
       </div>
     </div>
   </div>
@@ -1066,6 +1107,20 @@ async function loadMeta(f) {
 function metaIfDirty() {
   if (!META_KEYS.length) return null;
   return Object.fromEntries(META_KEYS.map(k => [k, META_VALUES[k] ?? '']));
+}
+async function applyMetaBatch() {
+  const values = metaIfDirty();
+  if (!values || !Object.values(values).some(v => (v || '').trim()))
+    return toast('عبّئ حقلاً واحداً على الأقل أولاً');
+  if (!confirm('تطبيق الحقول المعبأة على كل ملفات المجلد المفتوح؟\\n' +
+               'الحقول الفارغة لن تُلمس، ولا يمكن التراجع.')) return;
+  try {
+    const d = await api('/api/meta_batch', { values });
+    let msg = `تم: ${d.done} ملف حُدّث، ${d.skipped} لم يحتج تغييراً`;
+    if (d.failed) msg += `، ${d.failed} فشلت`;
+    status(msg); toast(msg);
+    if (d.errors && d.errors.length) console.log('meta errors:', d.errors);
+  } catch (e) { toast('خطأ: ' + e.message); }
 }
 
 /* ---------- planning / live preview ---------- */
