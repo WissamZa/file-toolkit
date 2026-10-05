@@ -623,8 +623,20 @@ main { padding:16px 26px 60px; max-width:1320px; margin:0 auto; }
 .btn.small { padding:6px 12px; font-size:12.5px; }
 .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
 .spacer { flex:1; }
-.grid { display:grid; grid-template-columns:1fr 360px; gap:14px; align-items:start; }
-@media (max-width:1020px){ .grid { grid-template-columns:1fr; } }
+.grid { display:grid; grid-template-columns:1fr 350px 210px; gap:14px; align-items:start; }
+@media (max-width:1100px){ .grid { grid-template-columns:1fr 350px; }
+  #file-list-card { grid-column:1 / -1; order:3; } }
+@media (max-width:760px){ .grid { grid-template-columns:1fr; } }
+#file-list { max-height:66vh; overflow-y:auto; margin-top:6px; }
+.fl-item { display:flex; align-items:center; gap:6px; width:100%; text-align:right;
+  padding:6px 9px; border:none; border-radius:8px; cursor:pointer; font:inherit;
+  font-size:12px; background:transparent; color:var(--text); direction:ltr;
+  overflow:hidden; }
+.fl-item:hover { background:var(--surface2); }
+.fl-item.cur { background:var(--accent); color:#fff; font-weight:700; }
+.fl-item .mark { flex-shrink:0; }
+.fl-item.renamed .name { color:var(--ok); text-decoration:line-through; }
+.fl-item.cur.renamed .name { color:#fff; }
 .preview-wrap { background:#0b0d11; border:1px solid var(--border); border-radius:14px;
   min-height:460px; display:grid; place-items:center; overflow:hidden; position:relative; }
 body.light .preview-wrap { background:#dfe4ec; }
@@ -699,6 +711,12 @@ table.help td { padding:6px 8px; border-bottom:1px solid var(--border); font-siz
   </div>
 
   <div class="grid" id="work-grid" style="display:none;">
+    <div class="card" id="file-list-card">
+      <div class="row" style="font-weight:800;">📁 الملفات
+        <span class="spacer"></span>
+        <span class="muted" id="fl-count" style="font-weight:400;"></span></div>
+      <div id="file-list"></div>
+    </div>
     <div>
       <div class="preview-wrap">
         <img id="pv-img" alt="">
@@ -879,6 +897,7 @@ async function openFolder() {
   try {
     const d = await api(`/api/list?folder=${encodeURIComponent(folder)}&sub=${$('sub-chk').checked ? 1 : 0}`);
     FILES = d.files; IDX = 0; PAGE = 0; PAGES = 1;
+    RENAMED.clear();
     $('folder-label').textContent = d.folder;
     $('work-grid').style.display = 'grid';
     $('empty-state').style.display = 'none';
@@ -895,6 +914,26 @@ async function openFolder() {
     if (FILES.length) load(0);
     else { $('pos').textContent = ''; toast('لا توجد ملفات مدعومة في هذا المجلد'); }
   } catch (e) { toast('خطأ: ' + e.message); }
+}
+
+/* ---------- side file list ---------- */
+const RENAMED = new Set();               // names renamed this session
+function renderFileList() {
+  const box = $('file-list');
+  if (!box) return;
+  box.innerHTML = '';
+  $('fl-count').textContent = FILES.length ? `${FILES.length}` : '';
+  for (let i = 0; i < FILES.length; i++) {
+    const b = document.createElement('button');
+    b.className = 'fl-item' + (i === IDX ? ' cur' : '') +
+                  (RENAMED.has(FILES[i].name) ? ' renamed' : '');
+    b.title = FILES[i].path;
+    b.innerHTML = `<span class="mark">${i === IDX ? '▶' :
+                   (RENAMED.has(FILES[i].name) ? '✓' : '')}</span>
+                   <span class="name">${FILES[i].name}</span>`;
+    b.onclick = () => load(i);
+    box.appendChild(b);
+  }
 }
 
 /* ---------- file loading / preview ---------- */
@@ -917,6 +956,7 @@ async function load(i) {
     $('pv-img').src = `/api/file?max=1400&path=${encodeURIComponent(f.path)}`;
   }
   await loadMeta(f);
+  renderFileList();
   refreshPreview();
 }
 async function showPdfPage(f) {
@@ -1033,6 +1073,7 @@ async function commit(f, new_name, overwrite, keep_both) {
     status(d.msgs.join(' • ') || 'لا تغيير؛ انتقلنا للملف التالي');
     toast(d.msgs.join(' • ') || 'لا تغيير');
     f.path = d.path; f.name = d.path.split('/').pop();
+    RENAMED.add(f.name);
     if ($('tpl').value && /{n(?::[^}]*)?}/i.test($('tpl').value))
       $('counter').value = (parseInt($('counter').value || '1')) + 1;
     if (IDX + 1 < FILES.length) load(IDX + 1);
@@ -1100,6 +1141,7 @@ async function openFolderSoft() {
     const d = await api(`/api/list?folder=${encodeURIComponent(folder)}&sub=${$('sub-chk').checked ? 1 : 0}`);
     FILES = d.files;
     IDX = Math.min(IDX, Math.max(0, FILES.length - 1));
+    RENAMED.clear();
     if (FILES.length) load(IDX); else { $('pos').textContent = ''; }
   } catch (e) { /* keep current state */ }
 }
