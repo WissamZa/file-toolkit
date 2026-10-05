@@ -713,8 +713,9 @@ main { padding:16px 28px 70px; }
 .btn.small { padding:6px 12px; font-size:12.5px; }
 .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
 .spacer { flex:1; }
-.grid { display:grid; grid-template-columns:1fr 350px 210px; gap:14px; align-items:start; }
-@media (max-width:1100px){ .grid { grid-template-columns:1fr 350px; }
+.grid { display:grid; grid-template-columns:230px 1fr 430px; gap:16px; align-items:start; }
+@media (max-width:1200px){ .grid { grid-template-columns:230px 1fr; }
+  #controls-col { grid-column:1 / -1; order:2; }
   #file-list-card { grid-column:1 / -1; order:3; } }
 @media (max-width:760px){ .grid { grid-template-columns:1fr; } }
 #file-list { max-height:66vh; overflow-y:auto; margin-top:6px; }
@@ -837,7 +838,7 @@ table.help td { padding:6px 8px; border-bottom:1px solid var(--border); font-siz
       </div>
     </div>
 
-    <div>
+    <div id="controls-col">
       <div class="card">
         <label class="fld">الاسم الجديد — اكتب النص مكان xx</label>
         <input type="text" id="typed" placeholder="اكتب هنا… (Enter فارغ = تخطي)">
@@ -846,16 +847,16 @@ table.help td { padding:6px 8px; border-bottom:1px solid var(--border); font-siz
              border-radius:9px; font-size:12.5px; font-weight:700;
              background:var(--warn); color:#10131a;"></div>
         <label class="fld">القالب</label>
-        <div class="row" style="flex-wrap:nowrap;">
-          <input type="text" id="tpl" list="tpl-list" class="ltr" style="flex:1;">
+        <div class="row" style="flex-wrap:nowrap; gap:8px;">
+          <input type="text" id="tpl" list="tpl-list" class="ltr" style="flex:1; min-width:0;">
           <datalist id="tpl-list"></datalist>
-          <button class="btn small" onclick="tplSave()" title="حفظ القالب">💾</button>
-          <button class="btn small" onclick="tplDel()" title="حذف القالب المحفوظ">🗑</button>
-          <button class="btn small" onclick="showHelp()">؟</button>
+          <button class="btn small" style="padding:9px 13px;" onclick="tplSave()" title="حفظ القالب">💾</button>
+          <button class="btn small" style="padding:9px 13px;" onclick="tplDel()" title="حذف القالب المحفوظ">🗑</button>
+          <button class="btn small" style="padding:9px 13px;" onclick="showHelp()">؟</button>
         </div>
-        <div class="row" style="margin-top:8px;">
-          <span class="muted" style="font-size:12.5px;">العدّاد {n} يبدأ من</span>
-          <input type="number" id="counter" value="1" style="width:80px;" min="0">
+        <div class="row" style="margin-top:10px;">
+          <span class="muted" style="font-size:13px;">العدّاد {n} يبدأ من</span>
+          <input type="number" id="counter" value="1" style="width:110px;" min="0">
         </div>
         <div class="row" style="margin-top:10px;">
           <button class="btn small" onclick="toggleRegex()">▸ Regex على الاسم الحالي</button>
