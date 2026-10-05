@@ -15,6 +15,7 @@ The renaming logic itself is imported verbatim from quick_renamer.py
 identical. Serves from 127.0.0.1 only; nothing leaves the machine.
 """
 
+import io
 import json
 import os
 import re
@@ -328,6 +329,38 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(data)
+        elif route == "/api/cropped":
+            """The image with the crop the teaching GUI learned applied."""
+            path = unquote((query.get("path") or [""])[0])
+            if not _under_session(path) or not os.path.isfile(path):
+                self._json(403, {"error": "مسار غير مسموح"})
+                return
+            conn = it._open_db()
+            try:
+                with Image.open(path) as img:
+                    img = ImageOps.exif_transpose(img)
+                    box, method, type_ = it.learned_crop(conn, img)
+                    if box is None:
+                        self._json(404, {"error":
+                            "لا يوجد قصّ مقترح لهذه الصورة"})
+                        return
+                    cropped = img.crop(box)
+                    buf = io.BytesIO()
+                    cropped.convert("RGB").save(buf, "JPEG", quality=88)
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(buf.getvalue())))
+                self.send_header("X-Crop-Method", method)
+                # HTTP headers are latin-1 only — send the type KEY and let
+                # the UI render its Arabic label.
+                self.send_header("X-Crop-Type", type_ or "other")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(buf.getvalue())
+            except Exception as e:
+                self._json(500, {"error": str(e)})
+            finally:
+                conn.close()
         elif route == "/api/meta":
             path = unquote((query.get("path") or [""])[0])
             if not _under_session(path) or not os.path.isfile(path):
@@ -731,6 +764,7 @@ table.help td { padding:6px 8px; border-bottom:1px solid var(--border); font-siz
           <span id="pos" style="font-weight:800;"></span>
           <div class="progressbar" style="flex:1; min-width:140px;"><div id="bar"></div></div>
           <span class="spacer"></span>
+          <button class="btn small" id="crop-btn" onclick="toggleCrop()">✂️ معاينة القصّ المتعلم</button>
           <button class="btn small" onclick="nav(-1)">→ السابق</button>
           <button class="btn small" onclick="nav(1)">تخطي ←</button>
         </div>
@@ -941,6 +975,8 @@ async function load(i) {
   IDX = i;
   const f = FILES[i];
   if (!f) return;
+  CROP_ON = false;
+  if ($('crop-btn')) $('crop-btn').textContent = '✂️ معاينة القصّ المتعلم';
   $('f-name').textContent = f.name;
   $('f-path').textContent = f.path;
   $('f-meta').textContent = `${f.ext} • ${f.size} • ${f.mtime}`;
@@ -972,6 +1008,32 @@ async function showPdfPage(f) {
 async function pageNav(step) {
   PAGE = Math.max(0, Math.min(PAGES - 1, PAGE + step));
   try { await showPdfPage(FILES[IDX]); } catch (e) { toast(e.message); }
+}
+
+/* ---------- learned-crop preview ---------- */
+let CROP_ON = false, CROP_FULL_SRC = '';
+async function toggleCrop() {
+  const img = $('pv-img'), btn = $('crop-btn');
+  if (CROP_ON) {                          // back to the full image
+    CROP_ON = false;
+    img.src = CROP_FULL_SRC;
+    btn.textContent = '✂️ معاينة القصّ المتعلم';
+    return;
+  }
+  const f = FILES[IDX];
+  if (!f) return;
+  try {
+    const res = await fetch(`/api/cropped?path=${encodeURIComponent(f.path)}`);
+    if (!res.ok) { const e = await res.json(); throw new Error(e.error); }
+    CROP_FULL_SRC = img.src;
+    CROP_ON = true;
+    img.src = URL.createObjectURL(await res.blob());
+    const method = res.headers.get('X-Crop-Method');
+    const typeKey = res.headers.get('X-Crop-Type');
+    const typeLabel = TYPES[typeKey] ? TYPES[typeKey].ar : '';
+    btn.textContent = '↩︎ عرض الصورة كاملة' +
+      (method === 'taught' ? ` (قصّ متعلَّم ✓ ${typeLabel})` : ' (تلقائي)');
+  } catch (e) { toast(e.message); }
 }
 function nav(step) {
   const i = IDX + step;
