@@ -32,6 +32,7 @@ import quick_renamer as qr
 
 UNDO_STACK = []            # [(log_id, new_path, old_path)] — session only
 SESSION = {"folder": None}  # folder the file list came from
+LAST_BATCH = {"run_id": None}  # most recent batch rename, for bulk undo
 
 
 # --------------------------------------------------------------------------
@@ -212,6 +213,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": "المجلد غير موجود"})
                 return
             SESSION["folder"] = folder
+            SESSION["sub"] = include_sub
             UNDO_STACK.clear()
             files = [f for f in (_file_payload(p)
                                  for p in _list_files(folder, include_sub))
@@ -331,8 +333,8 @@ class Handler(BaseHTTPRequestHandler):
                             "INSERT INTO operation_log (ts, run_id, op, "
                             " source, destination, detail, status) "
                             "VALUES (?, ?, 'move', ?, ?, ?, 'approved')",
-                            (datetime.now().isoformat(timespec="seconds"),
-                             "renamer", path, new, "quick renamer"))
+                        (datetime.now().isoformat(timespec="seconds"),
+                         it._new_run_id(), path, new, "quick renamer"))
                         conn.commit()
                         log_id = conn.execute(
                             "SELECT last_insert_rowid()").fetchone()[0]
@@ -345,6 +347,115 @@ class Handler(BaseHTTPRequestHandler):
                 msgs.append(f"أُعيدت التسمية إلى {os.path.basename(new)}")
             self._json(200, {"ok": True, "log_id": log_id,
                              "msgs": msgs, "path": new or path})
+        elif route == "/api/batch_plan":
+            """Plan the same template for every file in the opened folder."""
+            if not SESSION.get("folder"):
+                self._json(400, {"error": "افتح مجلداً أولاً"})
+                return
+            files = _list_files(SESSION["folder"], SESSION.get("sub", False))
+            rows = []
+            counter = int(data.get("counter") or 1)
+            for path in files:
+                new, err = qr.make_plan(
+                    path, typed=data.get("typed", ""), tpl=data.get("tpl", ""),
+                    ext_raw=data.get("ext") or qr.KEEP,
+                    find=data.get("find", ""), repl=data.get("repl", ""),
+                    icase=bool(data.get("icase")), counter=counter)
+                uses_n = any((m.group("tok") or "").lower() == "n"
+                             for m in qr.TPL_RE.finditer(data.get("tpl", "")))
+                if err is None and new is not None and new != path:
+                    counter += 1
+                rows.append({
+                    "path": path, "name": os.path.basename(path),
+                    "new": new, "err": err,
+                    "same": new == path or (new is None and err is None),
+                    "conflict": bool(new) and qr.conflicts(new, path),
+                })
+            self._json(200, {"rows": rows, "n": len(rows)})
+        elif route == "/api/batch_commit":
+            """Apply a planned batch; every rename shares one run_id so the
+            whole batch can be undone at once."""
+            if not SESSION.get("folder"):
+                self._json(400, {"error": "افتح مجلداً أولاً"})
+                return
+            ops = data.get("ops") or []
+            if not ops:
+                self._json(400, {"error": "لا عمليات في الخطة"})
+                return
+            run_id = it._new_run_id()
+            conn = it._open_db()
+            done = skipped = failed = 0
+            try:
+                for op in ops:
+                    path, new = op.get("path", ""), op.get("new", "")
+                    if not _under_session(path) or not os.path.isfile(path):
+                        skipped += 1
+                        continue
+                    if not new or os.path.abspath(new) == os.path.abspath(path):
+                        skipped += 1
+                        continue
+                    if os.path.exists(new):
+                        if data.get("keep_both"):
+                            new = qr.unique_path(new)
+                        else:
+                            skipped += 1
+                            continue
+                    try:
+                        os.rename(path, new)
+                        conn.execute(
+                            "INSERT INTO operation_log (ts, run_id, op, "
+                            " source, destination, detail, status) "
+                            "VALUES (?, ?, 'move', ?, ?, ?, 'approved')",
+                            (datetime.now().isoformat(timespec="seconds"),
+                             run_id, path, new, "batch rename"))
+                        log_id = conn.execute(
+                            "SELECT last_insert_rowid()").fetchone()[0]
+                        conn.commit()
+                        UNDO_STACK.append((log_id, new, path))
+                        done += 1
+                    except Exception:
+                        failed += 1
+                LAST_BATCH["run_id"] = run_id if done else None
+            finally:
+                conn.close()
+            self._json(200, {"done": done, "skipped": skipped,
+                             "failed": failed, "run_id": run_id})
+        elif route == "/api/undo_batch":
+            """Undo a whole batch rename (the most recent one by default)."""
+            run_id = data.get("run_id") or LAST_BATCH.get("run_id")
+            if not run_id:
+                self._json(200, {"ok": False, "error": "لا توجد دفعة جماعية"})
+                return
+            conn = it._open_db()
+            try:
+                rows = conn.execute(
+                    "SELECT id, source, destination FROM operation_log "
+                    "WHERE run_id = ? AND op = 'move' ORDER BY id DESC",
+                    (run_id,)).fetchall()
+                reverted = failed = 0
+                reverted_ids = []
+                for log_id, source, destination in rows:
+                    try:
+                        if os.path.exists(destination):
+                            target = source
+                            if os.path.exists(source):
+                                target = qr.unique_path(source)
+                            os.rename(destination, target)
+                        conn.execute("DELETE FROM operation_log WHERE id = ?",
+                                     (log_id,))
+                        reverted_ids.append(log_id)
+                        reverted += 1
+                    except Exception:
+                        failed += 1
+                conn.commit()
+            finally:
+                conn.close()
+            UNDO_STACK[:] = [u for u in UNDO_STACK
+                             if u[0] not in set(reverted_ids)]
+            if LAST_BATCH.get("run_id") == run_id:
+                LAST_BATCH["run_id"] = None
+            self._json(200, {"ok": True, "reverted": reverted,
+                             "failed": failed})
         elif route == "/api/undo":
             if not UNDO_STACK:
                 self._json(200, {"ok": False, "error": "لا شيء للتراجع عنه"})
@@ -558,8 +669,11 @@ table.help td { padding:6px 8px; border-bottom:1px solid var(--border); font-siz
       <div class="card">
         <button class="btn primary" style="width:100%; padding:12px;" onclick="saveNext()">
           💾 حفظ (+ بيانات) والتالي ⏎</button>
+        <button class="btn" style="width:100%; margin-top:8px;" onclick="openBatch()">
+          🏷️ إعادة تسمية جماعية — تطبيق القالب على كل الملفات</button>
         <div class="row" style="margin-top:8px;">
           <button class="btn" style="flex:1" onclick="doUndo()">↩︎ تراجع عن آخر إعادة تسمية (Ctrl+U)</button>
+          <button class="btn" style="flex:1" onclick="undoBatch()">↩︎ تراجع عن آخر دفعة جماعية</button>
         </div>
       </div>
       <div class="card">
@@ -581,6 +695,28 @@ table.help td { padding:6px 8px; border-bottom:1px solid var(--border); font-siz
       <button class="btn ok" onclick="resolveConflict('keep')">إبقاء الاثنين (اسم جديد تلقائي)</button>
       <button class="btn bad" onclick="resolveConflict('overwrite')">استبدال الموجود (لا يمكن التراجع)</button>
       <button class="btn" onclick="resolveConflict('cancel')">إلغاء</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-bg" id="batch-modal">
+  <div class="modal" style="max-width:820px;">
+    <h3>🏷️ إعادة تسمية جماعية — معاينة قبل التنفيذ</h3>
+    <div class="muted" style="margin-bottom:8px;">
+      سيُطبَّق القالب الحالي على كل ملفات المجلد المفتوح. لا شيء يُنفَّذ قبل ضغط «تنفيذ».</div>
+    <div style="max-height:46vh; overflow-y:auto; border:1px solid var(--border); border-radius:10px;">
+      <table id="batch-table" style="width:100%;">
+        <thead><tr><th>الاسم الحالي</th><th></th><th>الاسم الجديد</th><th>الحالة</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="row" style="margin-top:12px;">
+      <label class="row" style="gap:6px; cursor:pointer; font-size:13px;">
+        <input type="checkbox" id="batch-keep-both"> المتعارضة: إبقاء الاثنين بدل تخطيها
+      </label>
+      <span class="spacer"></span>
+      <button class="btn ok" id="batch-go" onclick="runBatch()">✓ تنفيذ الدفعة</button>
+      <button class="btn" onclick="hide('batch-modal')">إلغاء</button>
     </div>
   </div>
 </div>
@@ -795,6 +931,70 @@ async function commit(f, new_name, overwrite, keep_both) {
     if (IDX + 1 < FILES.length) load(IDX + 1);
     else { toast('انتهت قائمة الملفات ✓'); $('preview-line').textContent = ''; }
   } catch (e) { toast('خطأ: ' + e.message); }
+}
+
+/* ---------- batch rename ---------- */
+let BATCH_ROWS = [];
+async function openBatch() {
+  if (!FILES.length) return toast('افتح مجلداً فيه ملفات أولاً');
+  try {
+    const d = await api('/api/batch_plan', { ...planInput() });
+    BATCH_ROWS = d.rows;
+    const tb = $('batch-table').querySelector('tbody');
+    tb.innerHTML = '';
+    for (const r of d.rows) {
+      const tr = document.createElement('tr');
+      let badge, color;
+      if (r.err) { badge = '✗ ' + r.err; color = 'var(--bad)'; }
+      else if (r.same) { badge = '— لا تغيير'; color = 'var(--muted)'; }
+      else if (r.conflict) { badge = '⚠ يوجد ملف بنفس الاسم'; color = 'var(--warn)'; }
+      else { badge = '✓'; color = 'var(--ok)'; }
+      tr.innerHTML = `<td class="ltr">${r.name}</td>
+        <td class="muted">←</td>
+        <td class="ltr" style="color:${r.err || r.same ? 'var(--muted)' : 'var(--ok)'}">${r.new ? r.new.split('/').pop() : '—'}</td>
+        <td style="color:${color}; font-size:12.5px;">${badge}</td>`;
+      tb.appendChild(tr);
+    }
+    $('batch-modal').classList.add('show');
+  } catch (e) { toast('خطأ: ' + e.message); }
+}
+async function runBatch() {
+  const ops = BATCH_ROWS
+    .filter(r => !r.err && !r.same && r.new)
+    .map(r => ({ path: r.path, new: r.new, conflict: r.conflict }));
+  if (!ops.length) return toast('لا عمليات قابلة للتنفيذ');
+  try {
+    const d = await api('/api/batch_commit', { ops,
+      keep_both: $('batch-keep-both').checked });
+    hide('batch-modal');
+    status(`الدفعة: ${d.done} نُفّذت، ${d.skipped} تخطّت، ${d.failed} فشلت — التراجع متاح بضغطة`);
+    toast(`نُفّذت ${d.done} إعادة تسمية ✓`);
+    for (const op of ops) {
+      const f = FILES.find(x => x.path === op.path);
+      if (f) { f.path = op.new; f.name = op.new.split('/').pop(); }
+    }
+    await openFolderSoft();
+  } catch (e) { toast('خطأ: ' + e.message); }
+}
+async function undoBatch() {
+  try {
+    const d = await api('/api/undo_batch', {});
+    if (!d.ok) return toast(d.error || 'لا توجد دفعة جماعية');
+    toast(`تراجعت الدفعة: عاد ${d.reverted} ملف لمكانه ✓`);
+    status(`تراجعت الدفعة الجماعية: ${d.reverted} ملف` +
+           (d.failed ? `، ${d.failed} فشلت` : ''));
+    await openFolderSoft();
+  } catch (e) { toast('خطأ: ' + e.message); }
+}
+async function openFolderSoft() {
+  // refresh the in-memory list from disk without clearing the folder input
+  const folder = $('folder').value.trim();
+  try {
+    const d = await api(`/api/list?folder=${encodeURIComponent(folder)}&sub=${$('sub-chk').checked ? 1 : 0}`);
+    FILES = d.files;
+    IDX = Math.min(IDX, Math.max(0, FILES.length - 1));
+    if (FILES.length) load(IDX); else { $('pos').textContent = ''; }
+  } catch (e) { /* keep current state */ }
 }
 
 /* ---------- undo ---------- */
