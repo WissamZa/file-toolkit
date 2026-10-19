@@ -10,6 +10,7 @@ Imported lazily by file_toolkit.py, so it reaches back into it for the
 shared config, prompts and helpers.
 """
 
+import math
 import os
 import re
 import shutil
@@ -634,17 +635,39 @@ def learned_crop(conn, img):
     auto-detection. Returns (box or None, method, predicted_type) where
     method is 'taught' or 'auto'.
 
-    Teaching works per image size: screenshots and scans usually share
-    exact dimensions per source, so the average normalized box of every
-    taught example at this size is the crop."""
+    Taught boxes are normalized, so examples can be reused across different
+    resolutions. Prefer examples with a similar aspect ratio and use a
+    median box so one imprecise example cannot shift the crop for every image.
+    Low-quality examples are excluded. When no relevant example exists,
+    fall back to per-image detection."""
     width, height = img.size
-    row = conn.execute(
-        "SELECT type, AVG(box_l), AVG(box_t), AVG(box_r), AVG(box_b) "
-        "FROM crop_examples WHERE img_w = ? AND img_h = ? "
-        "GROUP BY type ORDER BY COUNT(*) DESC LIMIT 1",
-        (width, height)).fetchone()
-    if row is not None:
-        type_, nl, nt, nr, nb = row
+    aspect = width / height
+    examples = conn.execute(
+        "SELECT type, img_w, img_h, box_l, box_t, box_r, box_b "
+        "FROM crop_examples WHERE low_quality = 0").fetchall()
+    ranked = []
+    for row in examples:
+        type_, ex_w, ex_h, *coords = row
+        ex_aspect = ex_w / ex_h
+        distance = abs(math.log(aspect / ex_aspect))
+        # Reuse examples across resolutions and modest framing differences,
+        # but avoid applying a portrait crop to a landscape photo (or vice versa).
+        if distance <= 0.20:
+            ranked.append((distance, type_, coords))
+    if ranked:
+        ranked.sort(key=lambda item: item[0])
+        nearest = ranked[:5]
+        type_distances = defaultdict(list)
+        for distance, type_, _ in nearest:
+            type_distances[type_].append(distance)
+        type_ = min(type_distances, key=lambda kind: (
+            -len(type_distances[kind]),
+            sum(type_distances[kind]) / len(type_distances[kind]), kind))
+        selected = [coords for _, item_type, coords in nearest
+                    if item_type == type_]
+        normalized = [float(np.median([coords[i] for coords in selected]))
+                      for i in range(4)]
+        nl, nt, nr, nb = normalized
         left = max(0, min(width - 1, round(nl * width)))
         top = max(0, min(height - 1, round(nt * height)))
         right = max(left + 1, min(width, round(nr * width)))

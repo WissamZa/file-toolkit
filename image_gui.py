@@ -50,6 +50,18 @@ def _safe_path(raw):
     return path
 
 
+def _safe_image_path(raw):
+    """Allow image reads from the input folder and the crop output folder."""
+    try:
+        path = Path(unquote(raw)).resolve()
+        roots = (Path(ftk.TARGET_DIR).resolve(),
+                 Path(ftk.CROPPED_OUTPUT_DIR).resolve())
+    except (OSError, ValueError):
+        return None
+    return path if any(path == root or root in path.parents
+                       for root in roots) else None
+
+
 def _thumbnail(path, max_px=340):
     """JPEG thumbnail bytes, cached by (path, mtime, size)."""
     path = str(path)
@@ -152,7 +164,7 @@ class Handler(BaseHTTPRequestHandler):
         elif route == "/img":
             raw = (query.get("path") or [""])[0]
             max_px = min(1600, int((query.get("max") or ["340"])[0]))
-            path = _safe_path(raw)
+            path = _safe_image_path(raw)
             if path is None or not path.is_file():
                 self._json(403, {"error": "مسار غير مسموح"})
                 return
@@ -401,6 +413,12 @@ section { display:none; } section.active { display:block; }
 .canvas-wrap { position:relative; background:#0b0d11; border:1px solid var(--border);
   border-radius:14px; overflow:hidden; min-height:420px; display:grid; place-items:center; }
 #teach-img { max-width:100%; max-height:66vh; display:block; user-select:none; -webkit-user-drag:none; }
+#crop-preview { width:100%; max-height:55vh; object-fit:contain; display:block; background:#0b0d11; }
+.compare-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+.compare-pane { min-width:0; background:var(--surface2); border-radius:10px; padding:8px; }
+.compare-pane img { width:100%; height:220px; object-fit:contain; background:#0b0d11; border-radius:7px; }
+.compare-label { font-weight:800; font-size:12px; margin:0 0 6px; }
+@media(max-width:560px){ .compare-grid { grid-template-columns:1fr; } }
 #crop-box { position:absolute; border:2px solid var(--warn); box-shadow:0 0 0 9999px rgba(5,7,10,.55);
   cursor:move; }
 #crop-box.taught { border-color:var(--ok); }
@@ -481,6 +499,18 @@ footer { text-align:center; color:var(--muted); font-size:12px; padding:20px; }
             <div class="h" data-h="bl"></div><div class="h" data-h="br"></div>
           </div>
         </div>
+        <div class="card" style="margin-top:12px;">
+          <div class="row" style="margin-bottom:8px;">
+            <span style="font-weight:800;">مراجعة القص قبل الحفظ</span>
+            <span class="muted">حدّد الورقة كاملة مع هامش مناسب</span>
+          </div>
+          <div class="compare-grid">
+            <div class="compare-pane"><div class="compare-label">قبل القص — الصورة الأصلية</div>
+              <img id="teach-before" alt="الصورة قبل القص"></div>
+            <div class="compare-pane"><div class="compare-label">بعد القص — المعاينة</div>
+              <canvas id="crop-preview" aria-label="معاينة الصورة بعد القص"></canvas></div>
+          </div>
+        </div>
         <div class="card" style="margin-top:14px;">
           <div class="row">
             <span id="t-name" style="font-weight:800;"></span>
@@ -500,7 +530,7 @@ footer { text-align:center; color:var(--muted); font-size:12px; padding:20px; }
         </div>
         <div class="card">
           <button class="btn primary" style="width:100%" onclick="teachSave(false)">
-            💾 حفظ المثال والتالي (Enter)</button>
+            ✓ اعتماد القص وحفظ المثال والتالي (Enter)</button>
           <button class="btn ok" style="width:100%; margin-top:8px;" onclick="teachSave(true)">
             ✂️ حفظ + قصّ النسخة الآن</button>
           <div class="row" style="margin-top:8px;">
@@ -508,7 +538,7 @@ footer { text-align:center; color:var(--muted); font-size:12px; padding:20px; }
             <button class="btn" style="flex:1" onclick="teachNav(-1)">السابق →</button>
           </div>
           <div class="muted" style="margin-top:10px; font-size:12.5px; line-height:1.8;">
-            اسحب على الصورة لرسم مربع القص، أو اسحب من داخله لتحريكه، ومن الزوايا لتغيير حجمه.
+            راجع معاينة «بعد القص» قبل الاعتماد. اسحب لرسم إطار القص، واسحب داخله لتحريكه أو من الزوايا لتغيير حجمه.
           </div>
         </div>
       </div>
@@ -533,8 +563,8 @@ footer { text-align:center; color:var(--muted); font-size:12px; padding:20px; }
         <button class="btn" onclick="loadPending()">تحديث</button>
       </div>
       <div class="muted" style="margin-top:8px;">
-        المعالجة الذاتية تقصّ كل الصور بما تعلمه البرنامج، وكل نسخة تظهر هنا بانتظار قرارك —
-        الاعتماد يبقيها، والرفض يحذفها. الأصول لا تُلمس أبداً.
+        تظهر كل صورة أصلية بجانب نسختها بعد القص. راجع حدود الورقة في النتيجة ثم اعتمدها؛
+        الرفض يحذف النسخة المقصوصة. الأصول لا تُلمس أبداً.
       </div>
     </div>
     <div id="pending-list" class="pending-grid"></div>
@@ -559,8 +589,9 @@ footer { text-align:center; color:var(--muted); font-size:12px; padding:20px; }
         <tbody></tbody>
       </table>
       <div class="muted" style="margin-top:8px;">
-        كلما علّمت البرنامج صورة من تبويب التعليم، تُطبَّق نفس نِسَب القصّ تلقائياً على كل
-        الصور القادمة بنفس الأبعاد (صور من نفس المصدر عادة).
+        تُحفظ حدود القص كنِسَب من أبعاد الصورة، لذلك يمكن الاستفادة من المثال مع صور
+        بأحجام مختلفة. يختار البرنامج أمثلة قريبة في نسبة العرض إلى الارتفاع، ويتجاهل
+        الأمثلة المحددة كجودة منخفضة؛ وإذا لم يجد مثالاً مناسباً يستخدم الكشف التلقائي.
       </div>
     </div>
   </section>
@@ -637,6 +668,7 @@ async function loadTeach(refresh) {
   IDX = Math.min(IDX, IMAGES.length - 1);
   const img = IMAGES[IDX];
   $('teach-img').src = '/img?max=900&path=' + encodeURIComponent(img.path);
+  $('teach-before').src = '/img?max=600&path=' + encodeURIComponent(img.path);
   $('t-name').textContent = img.name;
   $('t-progress').textContent = `صورة ${IDX + 1} من ${IMAGES.length}`;
   $('t-bar').style.width = ((IDX + 1) / IMAGES.length * 100) + '%';
@@ -661,6 +693,7 @@ function imgScale() {
 }
 function drawBox() {
   const box = $('crop-box'), img = $('teach-img');
+  drawCropPreview();
   if (!BOX || img.hidden) return;
   box.hidden = false;
   box.classList.toggle('taught', METHOD === 'taught');
@@ -672,6 +705,18 @@ function drawBox() {
   box.style.top = (offY + BOX[1]*s) + 'px';
   box.style.width = ((BOX[2]-BOX[0])*s) + 'px';
   box.style.height = ((BOX[3]-BOX[1])*s) + 'px';
+}
+function drawCropPreview() {
+  const canvas = $('crop-preview'), img = $('teach-img');
+  if (!canvas || !img || !img.complete || !img.naturalWidth || !BOX) return;
+  const sx = Math.max(0, Math.floor(BOX[0] / IMGW * img.naturalWidth));
+  const sy = Math.max(0, Math.floor(BOX[1] / IMGH * img.naturalHeight));
+  const ex = Math.min(img.naturalWidth, Math.ceil(BOX[2] / IMGW * img.naturalWidth));
+  const ey = Math.min(img.naturalHeight, Math.ceil(BOX[3] / IMGH * img.naturalHeight));
+  if (ex <= sx || ey <= sy) return;
+  canvas.width = ex - sx; canvas.height = ey - sy;
+  canvas.getContext('2d').drawImage(img, sx, sy, ex-sx, ey-sy,
+                                    0, 0, canvas.width, canvas.height);
 }
 function clampBox() {
   BOX[0] = Math.max(0, Math.min(IMGW-2, BOX[0]));
@@ -757,10 +802,15 @@ async function loadPending() {
     const card = document.createElement('div');
     card.className = 'pending-card';
     card.innerHTML = `
-      <img src="/img?max=340&path=${encodeURIComponent(op.source_full)}">
+      <div class="compare-grid" style="padding:8px;">
+        <div class="compare-pane"><div class="compare-label">قبل القص</div>
+          <img src="/img?max=700&path=${encodeURIComponent(op.source_full)}" alt="قبل القص"></div>
+        <div class="compare-pane"><div class="compare-label">بعد القص</div>
+          <img src="/img?max=700&path=${encodeURIComponent(op.destination)}" alt="بعد القص"></div>
+      </div>
       <div class="body">
         <div class="name">${op.source}</div>
-        <div class="meta">${method} • ${type}</div>
+        <div class="meta">${method} • ${type} • قارن النتيجتين ثم اعتمد أو ارفض</div>
         <div class="actions">
           <button class="btn ok">✓ اعتماد</button>
           <button class="btn bad">✗ رفض</button>
