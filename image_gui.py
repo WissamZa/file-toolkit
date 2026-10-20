@@ -50,18 +50,6 @@ def _safe_path(raw):
     return path
 
 
-def _safe_image_path(raw):
-    """Allow image reads from the input folder and the crop output folder."""
-    try:
-        path = Path(unquote(raw)).resolve()
-        roots = (Path(ftk.TARGET_DIR).resolve(),
-                 Path(ftk.CROPPED_OUTPUT_DIR).resolve())
-    except (OSError, ValueError):
-        return None
-    return path if any(path == root or root in path.parents
-                       for root in roots) else None
-
-
 def _thumbnail(path, max_px=340):
     """JPEG thumbnail bytes, cached by (path, mtime, size)."""
     path = str(path)
@@ -164,7 +152,7 @@ class Handler(BaseHTTPRequestHandler):
         elif route == "/img":
             raw = (query.get("path") or [""])[0]
             max_px = min(1600, int((query.get("max") or ["340"])[0]))
-            path = _safe_image_path(raw)
+            path = _safe_path(raw)
             if path is None or not path.is_file():
                 self._json(403, {"error": "مسار غير مسموح"})
                 return
@@ -192,12 +180,20 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 with Image.open(path) as img:
                     img = ImageOps.exif_transpose(img)
-                    box, method, type_ = it.learned_crop(conn, img)
+                    plan = it.plan_crop(conn, img)
                 self._json(200, {
-                    "box": list(box) if box else None,
-                    "method": method,
-                    "type": type_ or "other",
+                    "box": list(plan.box) if plan.box else None,
+                    "detect_quad": plan.detect_quad,
+                    "method": plan.method,
+                    "type": plan.type or "other",
+                    "conf": round(plan.conf, 3),
+                    "warnings": plan.warnings,
+                    "warning_labels": [it.WARNING_LABELS.get(w, w)
+                                       for w in plan.warnings],
+                    "angle": round(plan.angle, 1),
+                    "reason": plan.reason,
                     "w": img.width, "h": img.height,
+                    "model": it.model_info(conn),
                 })
             except Exception as e:
                 self._json(500, {"error": str(e)})
@@ -211,6 +207,7 @@ class Handler(BaseHTTPRequestHandler):
                     "id": row[0], "source": _rel(row[3]),
                     "source_full": row[3], "destination": row[4],
                     "detail": row[5],
+                    "info": it.parse_detail(row[5]),
                 } for row in rows]
                 self._json(200, {"ops": pending,
                                  **_state_snapshot(conn)})
@@ -229,8 +226,12 @@ class Handler(BaseHTTPRequestHandler):
                     "SELECT type, img_w, img_h, COUNT(*) FROM crop_examples "
                     "GROUP BY type, img_w, img_h ORDER BY COUNT(*) DESC"
                 ).fetchall()
+                offs = it.learned_offsets(conn)
                 self._json(200, {
+                    "model": it.model_info(conn),
                     "params": params,
+                    "offsets": None if offs is None else
+                    [round(o * 100, 2) for o in offs],
                     "examples_list": [{
                         "type": it.TYPE_LABELS.get(r[0], r[0]),
                         "size": f"{r[1]}×{r[2]}", "count": r[3],
@@ -267,7 +268,7 @@ class Handler(BaseHTTPRequestHandler):
                     r = max(l + 1, min(img.width, r))
                     b = max(t + 1, min(img.height, b))
                     it.save_crop_example(
-                        conn, path, img.size, type_, (l, t, r, b),
+                        conn, path, img, type_, (l, t, r, b),
                         low_quality=bool(data.get("low_quality")))
                     copied = None
                     if data.get("also_crop"):
@@ -285,19 +286,39 @@ class Handler(BaseHTTPRequestHandler):
                              "taught in web GUI"))
                         conn.commit()
                         copied = str(destination)
+                threading.Thread(target=_warm_model, daemon=True).start()
                 self._json(200, {"ok": True, "copied": copied,
+                                 "model": it.model_info(conn),
                                  **_state_snapshot(conn)})
             except Exception as e:
                 self._json(500, {"error": str(e)})
             finally:
                 conn.close()
         elif route == "/api/work":
-            run_id, created, skipped = it.run_autonomous_crop()
+            run_id, created, skipped = it.run_autonomous_crop(
+                deskew=bool(data.get("deskew")))
             conn = it._open_db()
             try:
                 self._json(200, {"run_id": run_id, "created": created,
                                  "skipped": skipped,
                                  **_state_snapshot(conn)})
+            finally:
+                conn.close()
+        elif route == "/api/evaluate":
+            conn = it._open_db()
+            try:
+                it.get_model(conn)
+                res = it.evaluate_model(conn)
+                if res is None:
+                    self._json(200, {"error": "يلزم 4 صور معلَّمة على الأقل "
+                                              "لقياس الدقة"})
+                else:
+                    self._json(200, {
+                        "mean_iou": round(res["mean_iou"], 3), "n": res["n"],
+                        "per": [[n, round(v, 3)] for n, v in res["per"]],
+                        "model": it.model_info(conn)})
+            except Exception as e:
+                self._json(500, {"error": str(e)})
             finally:
                 conn.close()
         elif route == "/api/review":
@@ -332,13 +353,28 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "غير موجود"})
 
 
+def _warm_model():
+    """Retrain in the background right after an example is saved, so the
+    next suggestion does not have to wait for it."""
+    conn = it._open_db()
+    try:
+        it.get_model(conn)
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+
 LEARNED_PARAM_INFO = [
     ("similarity_threshold", "عتبة التشابه",
      "أقصى مسافة بصمة يُعد عندها صورتان متشابهتين (المسموح 4–20)"),
-    ("crop_margin", "هامش القص",
-     "بكسلات تُترك حول المحتوى عند القصّ التلقائي (المسموح 0–120)"),
+    ("crop_margin_pct", "هامش القص",
+     "نسبة مئوية من ضلع الصورة القصير تُترك حول الورقة (المسموح 0–8) — "
+     "لا تعتمد على أبعاد الصورة"),
     ("crop_tolerance", "تسامح الخلفية",
      "كم قد يختلف البكسل عن لون الخلفية قبل عدّه محتوى (المسموح 5–90)"),
+    ("crop_deskew", "تعديل الميل",
+     "1 = تعديل ميل الورقة أثناء القص، 0 = قص مستطيل فقط"),
     ("crop_min_gain", "أقل مكسب للقصّ",
      "تجاهل الصور التي لا يوفر قصّها إلا أقل من هذه النسبة (المسموح 1–30)"),
 ]
@@ -413,12 +449,6 @@ section { display:none; } section.active { display:block; }
 .canvas-wrap { position:relative; background:#0b0d11; border:1px solid var(--border);
   border-radius:14px; overflow:hidden; min-height:420px; display:grid; place-items:center; }
 #teach-img { max-width:100%; max-height:66vh; display:block; user-select:none; -webkit-user-drag:none; }
-#crop-preview { width:100%; max-height:55vh; object-fit:contain; display:block; background:#0b0d11; }
-.compare-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
-.compare-pane { min-width:0; background:var(--surface2); border-radius:10px; padding:8px; }
-.compare-pane img { width:100%; height:220px; object-fit:contain; background:#0b0d11; border-radius:7px; }
-.compare-label { font-weight:800; font-size:12px; margin:0 0 6px; }
-@media(max-width:560px){ .compare-grid { grid-template-columns:1fr; } }
 #crop-box { position:absolute; border:2px solid var(--warn); box-shadow:0 0 0 9999px rgba(5,7,10,.55);
   cursor:move; }
 #crop-box.taught { border-color:var(--ok); }
@@ -441,7 +471,7 @@ section { display:none; } section.active { display:block; }
 .badge { display:inline-block; padding:3px 10px; border-radius:99px; font-size:11.5px;
   font-weight:700; }
 /* pending cards */
-.pending-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(270px,1fr));
+.pending-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(440px,1fr));
   gap:14px; }
 .pending-card { background:var(--surface); border:1px solid var(--border);
   border-radius:14px; overflow:hidden; }
@@ -464,6 +494,36 @@ tr:hover td { background:var(--surface2); }
 }
 #toast.show { opacity:1; }
 .empty { text-align:center; color:var(--muted); padding:40px 0; font-size:14.5px; }
+#canvas-wrap { touch-action:none; }
+#det-svg { position:absolute; pointer-events:none; }
+#det-svg polygon { fill:none; stroke:#4cc2ff; stroke-width:2; stroke-dasharray:6 4;
+  vector-effect:non-scaling-stroke; }
+#after-canvas { max-width:100%; background:#0b0d11; border:1px solid var(--border);
+  border-radius:10px; display:block; margin:8px auto 0; }
+.pill { display:inline-block; padding:2px 9px; border-radius:99px; font-size:11.5px;
+  font-weight:800; color:#fff; }
+.pill.ok { background:var(--ok); } .pill.warn { background:#c9871a; }
+.ba { display:grid; grid-template-columns:1fr 1fr; gap:2px; background:#0b0d11; cursor:zoom-in; }
+.pane { position:relative; height:230px; }
+.pane img, .pane svg { position:absolute; inset:0; width:100%; height:100%; }
+.pane img { object-fit:contain; }
+.pane svg polygon { fill:none; stroke-width:2.5; vector-effect:non-scaling-stroke; }
+.pane .tag { position:absolute; top:6px; right:6px; background:#000a; color:#fff;
+  font-size:11px; padding:2px 8px; border-radius:6px; }
+.pending-card.review { border-color:#c9871a; box-shadow:0 0 0 1px #c9871a55; }
+.pending-card .warns { color:#f2b24d; font-size:12px; margin-bottom:8px; line-height:1.7; }
+.chips { display:flex; gap:8px; margin:12px 0 0; }
+.chip { background:var(--surface2); border:1px solid var(--border); color:var(--text);
+  border-radius:99px; padding:5px 14px; cursor:pointer; font:inherit; font-size:12.5px; }
+.chip.sel { background:var(--accent); border-color:var(--accent); color:#fff; }
+#modal { position:fixed; inset:0; background:#000d; z-index:120; display:grid;
+  place-items:center; padding:20px; }
+#modal[hidden] { display:none; }
+#modal .box { background:var(--surface); border:1px solid var(--border); border-radius:14px;
+  padding:14px; max-width:96vw; max-height:94vh; overflow:auto; }
+#modal .big2 { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+#modal .pane { height:min(70vh,640px); background:#0b0d11; border-radius:8px; }
+@media (max-width:900px){ #modal .big2 { grid-template-columns:1fr; } .ba { grid-template-columns:1fr; } }
 footer { text-align:center; color:var(--muted); font-size:12px; padding:20px; }
 </style>
 </head>
@@ -494,21 +554,10 @@ footer { text-align:center; color:var(--muted); font-size:12px; padding:20px; }
       <div>
         <div class="canvas-wrap" id="canvas-wrap">
           <img id="teach-img" alt="">
+          <svg id="det-svg" hidden></svg>
           <div id="crop-box" hidden>
             <div class="h" data-h="tl"></div><div class="h" data-h="tr"></div>
             <div class="h" data-h="bl"></div><div class="h" data-h="br"></div>
-          </div>
-        </div>
-        <div class="card" style="margin-top:12px;">
-          <div class="row" style="margin-bottom:8px;">
-            <span style="font-weight:800;">مراجعة القص قبل الحفظ</span>
-            <span class="muted">حدّد الورقة كاملة مع هامش مناسب</span>
-          </div>
-          <div class="compare-grid">
-            <div class="compare-pane"><div class="compare-label">قبل القص — الصورة الأصلية</div>
-              <img id="teach-before" alt="الصورة قبل القص"></div>
-            <div class="compare-pane"><div class="compare-label">بعد القص — المعاينة</div>
-              <canvas id="crop-preview" aria-label="معاينة الصورة بعد القص"></canvas></div>
           </div>
         </div>
         <div class="card" style="margin-top:14px;">
@@ -516,7 +565,15 @@ footer { text-align:center; color:var(--muted); font-size:12px; padding:20px; }
             <span id="t-name" style="font-weight:800;"></span>
             <span class="muted" id="t-meta"></span>
             <span class="spacer"></span>
+            <span id="t-conf" class="pill"></span>
             <span id="t-method" class="badge"></span>
+          </div>
+          <div id="t-model" class="muted" style="margin-top:8px; font-size:12.5px; line-height:1.8;"></div>
+          <div id="t-warn" class="muted" style="margin-top:8px; color:#f2b24d; font-size:12.5px; line-height:1.8;"></div>
+          <div class="row" style="margin-top:8px;">
+            <button class="btn" onclick="resetToSuggestion()">↺ العودة للاقتراح التلقائي</button>
+            <label style="cursor:pointer; font-size:13px;"><input type="checkbox" id="t-showdet" checked
+              onchange="drawBox()"> أظهر الكشف التلقائي (خط أزرق متقطّع)</label>
           </div>
         </div>
       </div>
@@ -529,8 +586,13 @@ footer { text-align:center; color:var(--muted); font-size:12px; padding:20px; }
           </label>
         </div>
         <div class="card">
+          <div class="muted">معاينة ما بعد القص (تتحدّث أثناء السحب)</div>
+          <canvas id="after-canvas" width="10" height="10"></canvas>
+          <div id="after-info" class="muted" style="text-align:center; margin-top:6px; font-size:12px;"></div>
+        </div>
+        <div class="card">
           <button class="btn primary" style="width:100%" onclick="teachSave(false)">
-            ✓ اعتماد القص وحفظ المثال والتالي (Enter)</button>
+            💾 حفظ المثال والتالي (Enter)</button>
           <button class="btn ok" style="width:100%; margin-top:8px;" onclick="teachSave(true)">
             ✂️ حفظ + قصّ النسخة الآن</button>
           <div class="row" style="margin-top:8px;">
@@ -538,7 +600,7 @@ footer { text-align:center; color:var(--muted); font-size:12px; padding:20px; }
             <button class="btn" style="flex:1" onclick="teachNav(-1)">السابق →</button>
           </div>
           <div class="muted" style="margin-top:10px; font-size:12.5px; line-height:1.8;">
-            راجع معاينة «بعد القص» قبل الاعتماد. اسحب لرسم إطار القص، واسحب داخله لتحريكه أو من الزوايا لتغيير حجمه.
+            اسحب على الصورة لرسم مربع القص، أو اسحب من داخله لتحريكه، ومن الزوايا لتغيير حجمه.
           </div>
         </div>
       </div>
@@ -557,20 +619,39 @@ footer { text-align:center; color:var(--muted); font-size:12px; padding:20px; }
     <div class="card">
       <div class="row">
         <button class="btn primary" onclick="runWork()">▶ تشغيل المعالجة الذاتية</button>
-        <button class="btn ok" onclick="approveAll()">✓ اعتماد كل المعلّق</button>
+        <button class="btn ok" onclick="approveConfident()">✓ اعتماد الموثوق فقط</button>
+        <button class="btn" onclick="approveAll()">اعتماد الكل</button>
         <button class="btn bad" onclick="undoLast()">↩︎ التراجع عن آخر دفعة</button>
         <span class="spacer"></span>
         <button class="btn" onclick="loadPending()">تحديث</button>
       </div>
       <div class="muted" style="margin-top:8px;">
-        تظهر كل صورة أصلية بجانب نسختها بعد القص. راجع حدود الورقة في النتيجة ثم اعتمدها؛
-        الرفض يحذف النسخة المقصوصة. الأصول لا تُلمس أبداً.
+        المعالجة الذاتية تكشف الورقة في كل صورة مهما كانت أبعادها، وكل نتيجة تظهر هنا
+        <b>قبل</b> (الإطار = حدود القص) و<b>بعد</b> بانتظار قرارك. الإطار البرتقالي = ثقة منخفضة،
+        راجعه. الأصول لا تُلمس أبداً.
       </div>
+      <label style="display:block; margin-top:10px; cursor:pointer; font-size:13.5px;">
+        <input type="checkbox" id="w-deskew"> تعديل ميل الورقة (تدوير الورقة المائلة لتصبح مستقيمة)
+      </label>
+      <div class="chips">
+        <button class="chip sel" id="f-all" onclick="setFilter('all')">الكل</button>
+        <button class="chip" id="f-review" onclick="setFilter('review')">⚠ تحتاج مراجعة</button>
+      </div>
+      <div id="skipped-box" class="muted" style="margin-top:10px; font-size:12.5px; line-height:1.9;"></div>
     </div>
     <div id="pending-list" class="pending-grid"></div>
   </section>
 
   <section id="tab-learned">
+    <div class="card">
+      <div class="row">
+        <span style="font-weight:800;">🧠 نموذج تحديد الفاتورة</span>
+        <span class="spacer"></span>
+        <button class="btn" id="eval-btn" onclick="evaluateModel()">قياس الدقة (اختبار على صور لم يرها)</button>
+      </div>
+      <div id="model-info" style="margin-top:10px; line-height:1.9;"></div>
+      <div id="eval-result" class="muted" style="margin-top:6px; font-size:12.5px; line-height:1.9;"></div>
+    </div>
     <div class="card">
       <div class="row">
         <span style="font-weight:800;">المعاملات المتعلمة</span>
@@ -589,17 +670,21 @@ footer { text-align:center; color:var(--muted); font-size:12px; padding:20px; }
         <tbody></tbody>
       </table>
       <div class="muted" style="margin-top:8px;">
-        تُحفظ حدود القص كنِسَب من أبعاد الصورة، لذلك يمكن الاستفادة من المثال مع صور
-        بأحجام مختلفة. يختار البرنامج أمثلة قريبة في نسبة العرض إلى الارتفاع، ويتجاهل
-        الأمثلة المحددة كجودة منخفضة؛ وإذا لم يجد مثالاً مناسباً يستخدم الكشف التلقائي.
+        التعليم لا يرتبط بأبعاد الصورة: يُحفظ كل مثال بنِسَب نسبية ويُقارَن بما كشفه البرنامج،
+        فيتعلّم <b>كم تُحبّ أن يكون الهامش حول الورقة</b> ويطبّقه على أي صورة بأي حجم.
+        <div id="offsets-info" style="margin-top:8px;"></div>
       </div>
     </div>
   </section>
 </main>
 <footer>يعمل محلياً بالكامل على جهازك — بلا سحابة ولا نماذج خارجية</footer>
+<div id="modal" hidden onclick="this.hidden=true"><div class="box" onclick="event.stopPropagation()">
+  <div class="row" style="margin-bottom:8px;"><b id="m-title"></b><span class="spacer"></span>
+    <button class="btn" onclick="$('modal').hidden=true">إغلاق ✕</button></div>
+  <div id="m-body" class="big2"></div></div></div>
 <div id="toast"></div>
 <script>
-let IMAGES = [], IDX = 0, BOX = null, IMGW = 0, IMGH = 0, METHOD = '', SUGGESTED = null, TYPES = {}, SEL_TYPE = 'other';
+let DETQUAD = null, OPS = [], FILTER = 'all', IMAGES = [], IDX = 0, BOX = null, IMGW = 0, IMGH = 0, METHOD = '', SUGGESTED = null, TYPES = {}, SEL_TYPE = 'other';
 const $ = id => document.getElementById(id);
 
 function toast(msg) {
@@ -638,10 +723,6 @@ document.querySelectorAll('nav button').forEach(btn => {
 });
 
 /* ---------- teach ---------- */
-async function initTypes() {
-  const res = await fetch('/api/learned');
-  // types come from the backend labels embedded below
-}
 function buildTypeButtons(selected) {
   SEL_TYPE = selected;
   const wrap = $('type-btns'); wrap.innerHTML = '';
@@ -667,25 +748,34 @@ async function loadTeach(refresh) {
   $('teach-img').hidden = false;
   IDX = Math.min(IDX, IMAGES.length - 1);
   const img = IMAGES[IDX];
+  $('teach-img').onload = drawBox;
   $('teach-img').src = '/img?max=900&path=' + encodeURIComponent(img.path);
-  $('teach-before').src = '/img?max=600&path=' + encodeURIComponent(img.path);
   $('t-name').textContent = img.name;
   $('t-progress').textContent = `صورة ${IDX + 1} من ${IMAGES.length}`;
   $('t-bar').style.width = ((IDX + 1) / IMAGES.length * 100) + '%';
   const sug = await api('/api/suggest?path=' + encodeURIComponent(img.path));
   IMGW = sug.w; IMGH = sug.h; METHOD = sug.method;
-  SUGGESTED = sug.box;
+  SUGGESTED = sug.box; DETQUAD = sug.detect_quad;
   BOX = sug.box ? [...sug.box] : [Math.round(sug.w*.1), Math.round(sug.h*.1),
                                   Math.round(sug.w*.9), Math.round(sug.h*.9)];
   buildTypeButtons(sug.type || 'other');
-  const badge = $('t-method');
-  if (sug.method === 'taught') {
-    badge.textContent = 'الاقتراح: قصّ متعلَّم ✓'; badge.style.background = 'var(--ok)';
-  } else {
-    badge.textContent = 'الاقتراح: كشف تلقائي'; badge.style.background = 'var(--warn)';
-  }
-  $('teach-img').onload = drawBox;
+  const badge = $('t-method'), pill = $('t-conf');
+  const names = { learned: 'نموذج متعلَّم ✓', taught: 'قصّ متعلَّم ✓', calibrated: 'كشف + تعلّم ✓', auto: 'كشف تلقائي', prior: 'من أمثلة معلَّمة' };
+  badge.textContent = 'الاقتراح: ' + (names[sug.method] || 'يدوي (لم تُكشف ورقة)');
+  badge.style.background = (sug.method === 'learned' || sug.method === 'taught' || sug.method === 'calibrated') ? 'var(--ok)' : 'var(--warn)';
+  pill.hidden = !sug.box;
+  pill.textContent = 'الثقة ' + Math.round(sug.conf * 100) + '%';
+  pill.className = 'pill ' + (sug.conf >= 0.70 ? 'ok' : 'warn');
+  const msgs = (sug.warning_labels || []).slice();
+  if (!sug.box && sug.reason) msgs.push(sug.reason + ' — ارسم المربع بنفسك');
+  $('t-warn').textContent = msgs.length ? '⚠ ' + msgs.join(' • ') : '';
+  $('t-meta').textContent = sug.w + '×' + sug.h;
+  showModel(sug.model);
   drawBox();
+}
+function resetToSuggestion() {
+  if (!SUGGESTED) return toast('لا يوجد اقتراح تلقائي لهذه الصورة');
+  BOX = [...SUGGESTED]; METHOD = 'auto'; drawBox();
 }
 function imgScale() {
   const el = $('teach-img');
@@ -693,10 +783,9 @@ function imgScale() {
 }
 function drawBox() {
   const box = $('crop-box'), img = $('teach-img');
-  drawCropPreview();
   if (!BOX || img.hidden) return;
   box.hidden = false;
-  box.classList.toggle('taught', METHOD === 'taught');
+  box.classList.toggle('taught', METHOD === 'learned' || METHOD === 'taught' || METHOD === 'calibrated');
   const wrap = $('canvas-wrap').getBoundingClientRect();
   const ir = img.getBoundingClientRect();
   const offX = ir.left - wrap.left, offY = ir.top - wrap.top;
@@ -705,18 +794,27 @@ function drawBox() {
   box.style.top = (offY + BOX[1]*s) + 'px';
   box.style.width = ((BOX[2]-BOX[0])*s) + 'px';
   box.style.height = ((BOX[3]-BOX[1])*s) + 'px';
+  const svg = $('det-svg');
+  if (DETQUAD && $('t-showdet').checked) {
+    svg.hidden = false;
+    svg.style.left = offX + 'px'; svg.style.top = offY + 'px';
+    svg.style.width = ir.width + 'px'; svg.style.height = ir.height + 'px';
+    svg.setAttribute('viewBox', '0 0 ' + IMGW + ' ' + IMGH);
+    svg.innerHTML = '<polygon points="' + DETQUAD.map(p => p[0] + ',' + p[1]).join(' ') + '"/>';
+  } else svg.hidden = true;
+  drawAfter();
 }
-function drawCropPreview() {
-  const canvas = $('crop-preview'), img = $('teach-img');
-  if (!canvas || !img || !img.complete || !img.naturalWidth || !BOX) return;
-  const sx = Math.max(0, Math.floor(BOX[0] / IMGW * img.naturalWidth));
-  const sy = Math.max(0, Math.floor(BOX[1] / IMGH * img.naturalHeight));
-  const ex = Math.min(img.naturalWidth, Math.ceil(BOX[2] / IMGW * img.naturalWidth));
-  const ey = Math.min(img.naturalHeight, Math.ceil(BOX[3] / IMGH * img.naturalHeight));
-  if (ex <= sx || ey <= sy) return;
-  canvas.width = ex - sx; canvas.height = ey - sy;
-  canvas.getContext('2d').drawImage(img, sx, sy, ex-sx, ey-sy,
-                                    0, 0, canvas.width, canvas.height);
+function drawAfter() {
+  const img = $('teach-img'), c = $('after-canvas');
+  if (!BOX || !img.naturalWidth) return;
+  const k = img.naturalWidth / IMGW;
+  const sw = Math.max(1, (BOX[2]-BOX[0]) * k), sh = Math.max(1, (BOX[3]-BOX[1]) * k);
+  const sc = Math.min(280 / sw, 260 / sh);
+  c.width = Math.max(1, Math.round(sw * sc)); c.height = Math.max(1, Math.round(sh * sc));
+  c.getContext('2d').drawImage(img, BOX[0]*k, BOX[1]*k, sw, sh, 0, 0, c.width, c.height);
+  const pct = Math.round((BOX[2]-BOX[0]) * (BOX[3]-BOX[1]) / (IMGW * IMGH) * 100);
+  $('after-info').textContent = Math.round(BOX[2]-BOX[0]) + '×' + Math.round(BOX[3]-BOX[1]) +
+    ' من ' + IMGW + '×' + IMGH + ' (' + pct + '% من الصورة)';
 }
 function clampBox() {
   BOX[0] = Math.max(0, Math.min(IMGW-2, BOX[0]));
@@ -725,7 +823,7 @@ function clampBox() {
   BOX[3] = Math.max(BOX[1]+1, Math.min(IMGH, BOX[3]));
 }
 let drag = null;
-$('canvas-wrap').addEventListener('mousedown', e => {
+$('canvas-wrap').addEventListener('pointerdown', e => {
   if (!$('teach-img') || $('teach-img').hidden) return;
   const wrap = $('canvas-wrap').getBoundingClientRect();
   const ir = $('teach-img').getBoundingClientRect();
@@ -744,7 +842,7 @@ $('canvas-wrap').addEventListener('mousedown', e => {
   METHOD = 'manual'; drawBox();
   e.preventDefault();
 });
-window.addEventListener('mousemove', e => {
+window.addEventListener('pointermove', e => {
   if (!drag) return;
   const ir = $('teach-img').getBoundingClientRect();
   let x = (e.clientX - ir.left) / imgScale(), y = (e.clientY - ir.top) / imgScale();
@@ -760,7 +858,7 @@ window.addEventListener('mousemove', e => {
   }
   drawBox();
 });
-window.addEventListener('mouseup', () => { if (drag) { drag = null; clampBox(); drawBox(); } });
+window.addEventListener('pointerup', () => { if (drag) { drag = null; clampBox(); drawBox(); } });
 window.addEventListener('resize', drawBox);
 async function teachSave(alsoCrop) {
   if (!BOX) return;
@@ -776,6 +874,7 @@ function teachNav(step) {
   loadTeach(false);
 }
 window.addEventListener('keydown', e => {
+  if (e.key === 'Escape') $('modal').hidden = true;
   if (!$('tab-teach').classList.contains('active')) return;
   if (e.key === 'Enter') teachSave(false);
   if (e.key === 'ArrowLeft') teachNav(1);
@@ -783,65 +882,115 @@ window.addEventListener('keydown', e => {
 });
 
 /* ---------- work ---------- */
-async function loadPending() {
-  const d = await api('/api/pending');
-  status(d);
-  const ops = d.ops || [];
+function isReview(op) {
+  const i = op.info || {};
+  if (i.conf === null || i.conf === undefined) return false;
+  const w = i.warnings || [];
+  return i.conf < 0.70 || w.includes('weak_prior') || w.includes('prior_disagree');
+}
+const WLAB = {
+  low_confidence: 'ثقة منخفضة — راجع القص', small_document: 'الورقة صغيرة في الصورة',
+  full_frame: 'الورقة تملأ الصورة', touches_edge: 'الورقة قريبة من الحافة / قد تكون مقطوعة',
+  tilted: 'الورقة مائلة', weak_prior: 'اعتُمد مثال معلَّم فقط (لم تُكشف ورقة)',
+  prior_disagree: 'القص المعلَّم يخالف الكشف التلقائي'
+};
+function setFilter(f) {
+  FILTER = f;
+  $('f-all').classList.toggle('sel', f === 'all');
+  $('f-review').classList.toggle('sel', f === 'review');
+  renderPending();
+}
+function paneHTML(op, big) {
+  const i = op.info || {}, src = i.src || [0, 0];
+  const color = isReview(op) ? '#f5aa32' : '#3ddc84';
+  const q = i.quad;
+  const poly = (q && src[0]) ? '<svg viewBox="0 0 ' + src[0] + ' ' + src[1] +
+    '" preserveAspectRatio="xMidYMid meet"><polygon stroke="' + color + '" points="' +
+    q.map(p => p[0] + ',' + p[1]).join(' ') + '"/></svg>' : '';
+  const mx = big ? 1400 : 420;
+  return '<div class="pane"><img src="/img?max=' + mx + '&path=' + encodeURIComponent(op.source_full) +
+    '">' + poly + '<span class="tag">قبل</span></div>' +
+    '<div class="pane"><img src="/img?max=' + mx + '&path=' + encodeURIComponent(op.destination) +
+    '"><span class="tag">بعد</span></div>';
+}
+function openModal(op) {
+  const i = op.info || {};
+  $('m-title').innerHTML = op.source + (i.src ? '   <span class="ltr">' + i.src[0] + '×' + i.src[1] + ' → ' + i.out[0] + '×' + i.out[1] + '</span>' : '');
+  $('m-body').innerHTML = paneHTML(op, true);
+  $('modal').hidden = false;
+}
+function renderPending() {
   const list = $('pending-list'); list.innerHTML = '';
+  let ops = OPS.slice();
+  ops.sort((a, b) => (isReview(b) - isReview(a)) ||
+    ((a.info.conf === null ? 1 : a.info.conf) - (b.info.conf === null ? 1 : b.info.conf)));
+  if (FILTER === 'review') ops = ops.filter(isReview);
   if (!ops.length) {
     list.innerHTML = '<div class="empty card" style="grid-column:1/-1">' +
-      'لا توجد عمليات بانتظار الاعتماد — شغّل المعالجة الذاتية أولاً</div>';
+      (OPS.length ? 'لا توجد نتائج تحتاج مراجعة 👍' :
+       'لا توجد عمليات بانتظار الاعتماد — شغّل المعالجة الذاتية أولاً') + '</div>';
     return;
   }
+  const methodNames = { learned: 'نموذج متعلَّم ✓', taught: 'قصّ متعلَّم ✓', calibrated: 'كشف + تعلّم ✓', auto: 'كشف تلقائي',
+                        prior: 'من أمثلة معلَّمة', legacy: 'قديم' };
   for (const op of ops) {
-    const parts = {};
-    (op.detail || '').split(',').forEach(p => {
-      const [k, v] = p.trim().split('='); parts[k] = v; });
-    const method = parts.method === 'taught' ? 'قصّ متعلَّم ✓' : 'تلقائي';
-    const type = TYPES[parts.type] ? TYPES[parts.type].ar : 'غير معروف';
+    const i = op.info || {};
+    const type = TYPES[i.type] ? TYPES[i.type].ar : 'غير معروف';
+    const rev = isReview(op);
+    const conf = (i.conf === null || i.conf === undefined) ? '' :
+      '<span class="pill ' + (rev ? 'warn' : 'ok') + '">ثقة ' + Math.round(i.conf * 100) + '%</span> ';
+    const dims = i.src ? '<span class="ltr">' + i.src[0] + '×' + i.src[1] + ' → ' + i.out[0] + '×' + i.out[1] + '</span> • ' : '';
+    const warns = (i.warnings || []).map(w => WLAB[w] || w);
     const card = document.createElement('div');
-    card.className = 'pending-card';
-    card.innerHTML = `
-      <div class="compare-grid" style="padding:8px;">
-        <div class="compare-pane"><div class="compare-label">قبل القص</div>
-          <img src="/img?max=700&path=${encodeURIComponent(op.source_full)}" alt="قبل القص"></div>
-        <div class="compare-pane"><div class="compare-label">بعد القص</div>
-          <img src="/img?max=700&path=${encodeURIComponent(op.destination)}" alt="بعد القص"></div>
-      </div>
-      <div class="body">
-        <div class="name">${op.source}</div>
-        <div class="meta">${method} • ${type} • قارن النتيجتين ثم اعتمد أو ارفض</div>
-        <div class="actions">
-          <button class="btn ok">✓ اعتماد</button>
-          <button class="btn bad">✗ رفض</button>
-        </div>
-      </div>`;
+    card.className = 'pending-card' + (rev ? ' review' : '');
+    card.innerHTML =
+      '<div class="ba" title="اضغط للتكبير">' + paneHTML(op, false) + '</div>' +
+      '<div class="body"><div class="name">' + op.source + '</div>' +
+      '<div class="meta">' + conf + dims + (methodNames[i.method] || i.method || '') + ' • ' + type +
+      (i.deskew ? ' • عُدِّل الميل' : '') + '</div>' +
+      (warns.length ? '<div class="warns">⚠ ' + warns.join(' • ') + '</div>' : '') +
+      '<div class="actions"><button class="btn ok">✓ اعتماد</button>' +
+      '<button class="btn bad">✗ رفض</button></div></div>';
+    card.querySelector('.ba').onclick = () => openModal(op);
     const [okB, badB] = card.querySelectorAll('button');
     okB.onclick = () => review([op.id], []);
     badB.onclick = () => review([], [op.id]);
     list.appendChild(card);
   }
 }
+async function loadPending() {
+  const d = await api('/api/pending');
+  status(d);
+  OPS = d.ops || [];
+  renderPending();
+}
 async function review(approve, reject) {
   const d = await api('/api/review', { approve, reject });
   status(d);
-  toast(reject.length ? `رُفضت ${reject.length} وحُذفت نسخها (${d.removed})` : `اعتُمدت ${approve.length} ✓`);
+  toast(reject.length ? 'رُفضت ' + reject.length + ' وحُذفت نسخها (' + d.removed + ')' : 'اعتُمدت ' + approve.length + ' ✓');
   loadPending();
 }
-async function approveAll() {
-  const d = await api('/api/pending');
-  const ops = d.ops || [];
-  if (!ops.length) return toast('لا يوجد معلّق');
-  if (!confirm(`اعتماد ${ops.length} عملية معلّقة؟`)) return;
-  const r = await api('/api/review', { approve: ops.map(p => p.id), reject: [] });
-  status(r); toast(`اعتُمدت ${d.pending.length} عملية ✓`);
+async function approveIds(ids, label) {
+  if (!ids.length) return toast('لا يوجد ما يُعتمد');
+  if (!confirm('اعتماد ' + ids.length + ' ' + label + '؟')) return;
+  const r = await api('/api/review', { approve: ids, reject: [] });
+  status(r); toast('اعتُمدت ' + ids.length + ' عملية ✓');
   loadPending();
+}
+function approveAll() { approveIds(OPS.map(p => p.id), 'عملية معلّقة'); }
+function approveConfident() {
+  const ids = OPS.filter(p => !isReview(p)).map(p => p.id);
+  const left = OPS.length - ids.length;
+  approveIds(ids, 'نتيجة موثوقة' + (left ? ' (ستبقى ' + left + ' للمراجعة)' : ''));
 }
 async function runWork() {
   toast('جارٍ المعالجة الذاتية…');
-  const d = await api('/api/work', {});
+  const d = await api('/api/work', { deskew: $('w-deskew').checked });
   status(d);
-  toast(`أُنشئت ${d.created} نسخة (${d.skipped} تخطّت) — راجعها واعتمدها`);
+  const sk = d.skipped || [];
+  $('skipped-box').innerHTML = sk.length ? '<b>تُخطّيت ' + sk.length + ':</b><br>' +
+    sk.slice(0, 20).map(x => '<span class="ltr">' + x[0] + '</span> — ' + x[1]).join('<br>') : '';
+  toast('أُنشئت ' + d.created + ' نسخة (' + sk.length + ' تخطّت) — راجع قبل/بعد ثم اعتمد');
   loadPending();
 }
 async function undoLast() {
@@ -850,6 +999,31 @@ async function undoLast() {
   status(d);
   toast(`تم التراجع عن ${d.reverted} عملية`);
   loadPending();
+}
+
+function modelText(m) {
+  if (!m) return '';
+  if (m.n < m.needed)
+    return 'النموذج: لم يبدأ بعد — علّمه ' + (m.needed - m.n) + ' صور أخرى على الأقل (علّمتَ ' + m.n +
+      '). حتى ذلك الحين يُستخدم الكشف التلقائي العام.';
+  const acc = (m.cv_iou === null || m.cv_iou === undefined) ? 'الدقة لم تُقَس بعد' :
+    'دقته التقديرية ' + Math.round(m.cv_iou * 100) + '%';
+  return 'النموذج يتعلّم من ' + m.n + ' صورة معلَّمة — ' + acc +
+    '. كل صورة تصحّحها وتحفظها تحسّنه.';
+}
+function showModel(m) { $('t-model').textContent = modelText(m); }
+async function evaluateModel() {
+  const btn = $('eval-btn'); btn.disabled = true; btn.textContent = 'جارٍ القياس… (قد يستغرق دقيقة)';
+  try {
+    const d = await api('/api/evaluate', {});
+    if (d.error) { toast(d.error); }
+    else {
+      $('eval-result').innerHTML = '<b>التطابق المتوسط مع صناديقك على صور لم يرها النموذج: ' +
+        Math.round(d.mean_iou * 100) + '%</b> (100% = مطابق تماماً؛ فوق 85% يعني أن القص يطابق ما ترسمه تقريباً)<br>' +
+        d.per.map(x => '<span class="ltr">' + x[0] + '</span> ' + Math.round(x[1] * 100) + '%').join(' • ');
+      $('model-info').textContent = modelText(d.model);
+    }
+  } finally { btn.disabled = false; btn.textContent = 'قياس الدقة (اختبار على صور لم يرها)'; }
 }
 
 /* ---------- learned ---------- */
@@ -865,6 +1039,11 @@ async function loadLearned() {
       <td class="muted">${p.desc}</td>`;
     pb.appendChild(tr);
   }
+  $('model-info').textContent = modelText(d.model);
+  const o = d.offsets;
+  $('offsets-info').innerHTML = o ? ('الهامش المتعلَّم حول الورقة (% من ضلع الصورة القصير): يسار <b>' + o[0] +
+    '</b> • أعلى <b>' + o[1] + '</b> • يمين <b>' + o[2] + '</b> • أسفل <b>' + o[3] + '</b>') :
+    '<span class="muted">يحتاج مثالين على الأقل بكشف واثق ليتعلّم الهامش (حتى ذلك الحين يُستخدم هامش القص الافتراضي).</span>';
   const eb = $('examples-table').querySelector('tbody'); eb.innerHTML = '';
   const examples = d.examples_list || [];
   if (!examples.length)

@@ -10,21 +10,27 @@ Imported lazily by file_toolkit.py, so it reaches back into it for the
 shared config, prompts and helpers.
 """
 
-import math
+import hashlib
+import json
 import os
+import threading
 import re
 import shutil
 import sqlite3
 import uuid
 from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import imagehash
 import numpy as np
 from PIL import Image, ImageOps
 
+import doc_crop
 import file_toolkit as tk
+import learned_crop as locator
 
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff'}
@@ -42,14 +48,16 @@ TYPE_LABELS = {
 # uses the default.
 DEFAULT_PARAMS = {
     "similarity_threshold": 10,   # max pHash hamming distance (/64) = similar
-    "crop_margin": 12,            # pixels of padding kept around the content
-    "crop_tolerance": 28,         # how far a pixel may differ from the border
-                                  # colour before it counts as content
+    "crop_margin_pct": 1.0,       # padding kept around the paper, in % of the
+                                  # photo's short side (size-independent)
+    "crop_tolerance": 28,         # sensitivity of the colour-difference test
+    "crop_deskew": 0,             # 1 = also straighten tilted papers
     "crop_min_gain": 5.0,         # skip cropping if it frees less than this %
 }
 PARAM_BOUNDS = {
     "similarity_threshold": (4, 20),
-    "crop_margin": (0, 120),
+    "crop_margin_pct": (0.0, 8.0),
+    "crop_deskew": (0, 1),
     "crop_tolerance": (5, 90),
     "crop_min_gain": (1.0, 30.0),
 }
@@ -111,12 +119,28 @@ def _open_db():
             low_quality INTEGER NOT NULL DEFAULT 0
         )
     ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS crop_model (
+            id INTEGER PRIMARY KEY,
+            signature TEXT NOT NULL,
+            n INTEGER NOT NULL,
+            cv_iou REAL,
+            blob BLOB NOT NULL
+        )
+    ''')
     # Older databases predate the status column — add it in place.
     columns = {row[1] for row in conn.execute(
         "PRAGMA table_info(operation_log)")}
     if "status" not in columns:
         conn.execute("ALTER TABLE operation_log ADD COLUMN "
                      "status TEXT NOT NULL DEFAULT 'approved'")
+    # What the detector found for each taught photo (relative units), so
+    # the user's correction can be learned independent of photo size.
+    columns = {row[1] for row in conn.execute(
+        "PRAGMA table_info(crop_examples)")}
+    for col in ("det_l", "det_t", "det_r", "det_b", "det_conf"):
+        if col not in columns:
+            conn.execute(f"ALTER TABLE crop_examples ADD COLUMN {col} REAL")
     conn.commit()
     return conn
 
@@ -473,55 +497,533 @@ def group_similar_images():
 
 # ==========================================================================
 # 4) Automatic document cropping
+#
+# Phone photos never share exact pixel dimensions or paper placement, so
+# nothing here is keyed to "image is WxH". The pipeline is:
+#   detect the paper (doc_crop)  ->  add the margin / learned correction
+#   ->  confidence + warnings    ->  before/after for the human to confirm
+# What the user teaches is stored in *relative* units (fractions of the
+# photo), so a lesson from one photo helps every other photo.
 # ==========================================================================
-def _content_bbox(arr, tolerance):
-    """Bounding box (left, top, right, bottom) of everything that differs
-    from the border colour, ignoring sparse noise rows/columns. Returns None
-    when the image looks uniformly one colour."""
-    height, width, _ = arr.shape
-    frame = max(2, min(height, width) // 50)
-    samples = np.concatenate([
-        arr[:frame].reshape(-1, 3),
-        arr[-frame:].reshape(-1, 3),
-        arr[:, :frame].reshape(-1, 3),
-        arr[:, -frame:].reshape(-1, 3),
-    ])
-    background = np.median(samples, axis=0)
+CONF_OK = doc_crop.CONF_OK
+CONF_MIN = doc_crop.CONF_MIN
 
-    diff = np.abs(arr - background).max(axis=2)
-    mask = diff > tolerance
-    if not mask.any():
+WARNING_LABELS = {
+    "low_confidence": "ثقة منخفضة — راجع القص",
+    "small_document": "الورقة صغيرة في الصورة",
+    "full_frame": "الورقة تملأ الصورة (لا حاجة للقص)",
+    "touches_edge": "الورقة قريبة من حافة الصورة / قد تكون مقطوعة",
+    "tilted": "الورقة مائلة",
+    "weak_prior": "اعتمد على مثال معلَّم فقط (لم تُكشف الورقة)",
+    "prior_disagree": "القص المعلَّم يخالف الكشف التلقائي",
+    "nothing_found": "لم يُعثر على ورقة",
+    "too_small": "الصورة صغيرة جداً",
+}
+
+
+@dataclass
+class CropPlan:
+    box: Optional[tuple] = None        # axis-aligned (l, t, r, b) in pixels
+    quad: Optional[list] = None        # outline that is cut (TL,TR,BR,BL)
+    deskew: bool = False               # quad is rotated and gets straightened
+    detect_quad: Optional[list] = None  # raw detection (for the overlay)
+    conf: float = 0.0
+    method: str = "none"               # auto | calibrated | taught | prior
+    type: Optional[str] = None
+    warnings: list = field(default_factory=list)
+    angle: float = 0.0
+    bg: tuple = (255, 255, 255)
+    size: tuple = (0, 0)               # source photo size
+    reason: Optional[str] = None       # why nothing will be cropped
+
+    @property
+    def out_size(self):
+        if self.quad is None:
+            return None
+        if self.deskew:
+            q = np.asarray(self.quad, dtype=float)
+            return (int(round((np.linalg.norm(q[1] - q[0])
+                               + np.linalg.norm(q[2] - q[3])) / 2)),
+                    int(round((np.linalg.norm(q[3] - q[0])
+                               + np.linalg.norm(q[2] - q[1])) / 2)))
+        l, t, r, b = self.box
+        return (r - l, b - t)
+
+    @property
+    def gain(self):
+        """Percent of the photo that cropping removes."""
+        out = self.out_size
+        if not out or not self.size[0]:
+            return 0.0
+        return max(0.0, (1 - out[0] * out[1] / (self.size[0] * self.size[1]))
+                   * 100)
+
+    @property
+    def needs_review(self):
+        return self.conf < CONF_OK or "weak_prior" in self.warnings \
+            or "prior_disagree" in self.warnings
+
+    def detail_json(self):
+        def rnd(q):
+            return None if q is None else [[round(float(x), 1),
+                                            round(float(y), 1)] for x, y in q]
+        return json.dumps({
+            "method": self.method, "type": self.type or "unknown",
+            "conf": round(self.conf, 3), "warnings": self.warnings,
+            "angle": round(self.angle, 2), "deskew": self.deskew,
+            "src": list(self.size), "out": list(self.out_size or (0, 0)),
+            "quad": rnd(self.quad), "detect_quad": rnd(self.detect_quad),
+            "box": list(self.box) if self.box else None,
+        }, ensure_ascii=False)
+
+
+def parse_detail(detail):
+    """Operation detail as a dict (older databases stored plain text)."""
+    try:
+        data = json.loads(detail)
+        if isinstance(data, dict):
+            return data
+    except (TypeError, ValueError):
+        pass
+    return {"method": "legacy", "note": detail or "", "warnings": [],
+            "conf": None}
+
+
+# -- what the user taught, in relative units --------------------------------
+def _norm_box(row):
+    """(l,t,r,b) of a crop_examples row as fractions of its photo."""
+    return (row["box_l"], row["box_t"], row["box_r"], row["box_b"])
+
+
+def _example_rows(conn):
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute("SELECT * FROM crop_examples "
+                            "WHERE low_quality = 0").fetchall()
+    finally:
+        conn.row_factory = None
+
+
+def _same_shape(w, h, ew, eh, tol=0.03):
+    """Same orientation and aspect ratio within `tol` (log scale). Photo
+    *size* is irrelevant: a 4000x3000 and a 1600x1200 shot match."""
+    if (w >= h) != (ew >= eh):
+        return False
+    return abs(np.log((w / h) / (ew / eh))) < tol
+
+
+def taught_prior(conn, w, h):
+    """Average taught box (as fractions) among examples with this photo's
+    shape. 'strong' only when 3+ examples agree closely — otherwise it is
+    only a fallback for photos where no paper can be detected."""
+    if conn is None:
         return None
-
-    # A row/column counts as content only if enough of it differs from the
-    # background — filters dust specks and sensor noise.
-    row_cut = max(3, int(width * 0.005))
-    col_cut = max(3, int(height * 0.005))
-    rows = np.where(mask.sum(axis=1) > row_cut)[0]
-    cols = np.where(mask.sum(axis=0) > col_cut)[0]
-    if rows.size == 0 or cols.size == 0:
+    rows = [r for r in _example_rows(conn)
+            if _same_shape(w, h, r["img_w"], r["img_h"])]
+    if not rows:
         return None
-    return int(cols[0]), int(rows[0]), int(cols[-1]) + 1, int(rows[-1]) + 1
+    boxes = np.array([_norm_box(r) for r in rows], dtype=float)
+    spread = float(boxes.std(axis=0).max()) if len(rows) > 1 else 1.0
+    types = [r["type"] for r in rows]
+    mean = boxes.mean(axis=0)
+    return {"box": (int(round(mean[0] * w)), int(round(mean[1] * h)),
+                    int(round(mean[2] * w)), int(round(mean[3] * h))),
+            "n": len(rows), "spread": spread,
+            "strong": len(rows) >= 3 and spread < 0.012,
+            "type": max(set(types), key=types.count)}
 
 
-def compute_crop(img, margin, tolerance):
-    """Crop box around the document in `img`, or (None, reason) when there
-    is nothing worth cutting. `img` must already be orientation-corrected."""
-    arr = np.asarray(img.convert("RGB"), dtype=np.int16)
-    bbox = _content_bbox(arr, tolerance)
-    if bbox is None:
-        return None, "image looks uniformly one colour"
-    left, top, right, bottom = bbox
-    left = max(0, left - margin)
-    top = max(0, top - margin)
-    right = min(img.width, right + margin)
-    bottom = min(img.height, bottom + margin)
-    return (left, top, right, bottom), None
+def learned_offsets(conn):
+    """How far outside (+) or inside (-) the detected paper the user's
+    boxes usually are, per side, as a fraction of the photo's short side.
+    Needs 2+ examples whose detection was confident."""
+    if conn is None:
+        return None
+    vals = []
+    for r in _example_rows(conn):
+        if r["det_conf"] is None or r["det_conf"] < CONF_OK:
+            continue
+        w, h = r["img_w"], r["img_h"]
+        side = min(w, h)
+        vals.append(((r["det_l"] - r["box_l"]) * w / side,
+                     (r["det_t"] - r["box_t"]) * h / side,
+                     (r["box_r"] - r["det_r"]) * w / side,
+                     (r["box_b"] - r["det_b"]) * h / side))
+    if len(vals) < 2:
+        return None
+    med = np.clip(np.median(np.array(vals), axis=0), -0.06, 0.10)
+    return tuple(float(v) for v in med)
+
+
+def _iou(a, b):
+    l, t = max(a[0], b[0]), max(a[1], b[1])
+    r, bt = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0, r - l) * max(0, bt - t)
+    union = ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1])
+             - inter)
+    return inter / union if union else 0.0
+
+
+def _box_quad(box):
+    l, t, r, b = box
+    return [[l, t], [r, t], [r, b], [l, b]]
+
+
+def _fit_inside(quad, w, h, margins, side):
+    """Expand a quad by `margins` (px), shrinking the growth until every
+    corner is inside the photo."""
+    for k in range(7):
+        f = 0.5 ** k
+        cand = doc_crop.expand_quad(quad, *[m * f for m in margins])
+        if (cand[:, 0].min() >= -1 and cand[:, 1].min() >= -1
+                and cand[:, 0].max() <= w + 1 and cand[:, 1].max() <= h + 1):
+            return cand
+    return np.asarray(quad, dtype=float)
+
+
+# -- the learned invoice locator --------------------------------------------
+LEARNED_OK = 0.60            # model confidence below this -> fall back
+_MODEL_CACHE = {}
+_FEAT_CACHE = {}
+_MODEL_LOCK = threading.Lock()
+
+
+def _taught_samples(conn):
+    """[(path, box_fraction, type)] — the newest example per photo; photos
+    that no longer exist are ignored."""
+    latest = {}
+    for r in _example_rows(conn):
+        latest[r["source_path"]] = r
+    out = []
+    for path, r in latest.items():
+        if os.path.exists(path):
+            out.append((path, _norm_box(r), r["type"]))
+    return sorted(out)
+
+
+def _features_of_path(path):
+    key = (path, os.path.getmtime(path))
+    f = _FEAT_CACHE.get(key)
+    if f is None:
+        with Image.open(path) as im:
+            f = locator.cell_features(ImageOps.exif_transpose(im))
+        _FEAT_CACHE[key] = f
+    return f
+
+
+def _signature(samples):
+    h = hashlib.md5(str(locator.MODEL_VERSION).encode())
+    for path, box, _ in samples:
+        h.update(f"{path}|{box[0]:.4f},{box[1]:.4f},{box[2]:.4f},"
+                 f"{box[3]:.4f}|{os.path.getmtime(path):.0f}".encode())
+    return h.hexdigest()
+
+
+def get_model(conn):
+    """The trained locator for the current examples (trained on demand and
+    cached in the database), or None when fewer than 3 photos were taught."""
+    samples = _taught_samples(conn)
+    if len(samples) < locator.MIN_EXAMPLES:
+        return None
+    sig = _signature(samples)
+    key = (tk.DB_NAME, sig)
+    with _MODEL_LOCK:
+        if key in _MODEL_CACHE:
+            return _MODEL_CACHE[key]
+        row = conn.execute("SELECT signature, blob FROM crop_model "
+                           "WHERE id = 1").fetchone()
+        model = None
+        if row and row[0] == sig:
+            model = locator.Model.from_bytes(row[1])
+        if model is None:
+            model = locator.train(
+                [(_features_of_path(p), b) for p, b, _ in samples])
+            old = conn.execute("SELECT cv_iou FROM crop_model WHERE id = 1"
+                               ).fetchone()
+            conn.execute("INSERT OR REPLACE INTO crop_model "
+                         "(id, signature, n, cv_iou, blob) "
+                         "VALUES (1, ?, ?, ?, ?)",
+                         (sig, len(samples), None, model.to_bytes()))
+            conn.commit()
+        _MODEL_CACHE[key] = model
+        return model
+
+
+def model_info(conn):
+    """{'n': taught photos, 'trained': bool, 'cv_iou': float|None}"""
+    samples = _taught_samples(conn)
+    row = conn.execute("SELECT signature, cv_iou FROM crop_model "
+                       "WHERE id = 1").fetchone()
+    fresh = bool(row) and len(samples) >= locator.MIN_EXAMPLES \
+        and row[0] == _signature(samples)
+    return {"n": len(samples),
+            "needed": locator.MIN_EXAMPLES,
+            "trained": fresh,
+            "cv_iou": row[1] if fresh and row[1] is not None else None}
+
+
+def evaluate_model(conn, folds=5):
+    """Honest accuracy estimate: train on some of the taught photos and
+    test on the others (k-fold). Returns {'mean_iou', 'per': [...]}"""
+    samples = _taught_samples(conn)
+    n = len(samples)
+    if n < locator.MIN_EXAMPLES + 1:
+        return None
+    folds = max(2, min(folds, n))
+    feats = [_features_of_path(p) for p, _, _ in samples]
+    per = []
+    for k in range(folds):
+        test = [i for i in range(n) if i % folds == k]
+        train_idx = [i for i in range(n) if i % folds != k]
+        if len(train_idx) < locator.MIN_EXAMPLES:
+            continue
+        m = locator.train([(feats[i], samples[i][1]) for i in train_idx])
+        for i in test:
+            pb = locator.predict(m, None, feats[i]).box_frac
+            per.append((os.path.basename(samples[i][0]),
+                        _iou(pb, samples[i][1])))
+    mean = float(np.mean([v for _, v in per])) if per else 0.0
+    sig = _signature(samples)
+    conn.execute("UPDATE crop_model SET cv_iou = ? WHERE id = 1 "
+                 "AND signature = ?", (mean, sig))
+    conn.commit()
+    return {"mean_iou": mean, "per": per, "n": n}
+
+
+def _learned_plan(conn, img, model):
+    W, H = img.size
+    pred = locator.predict(model, img)
+    l, t, r, b = pred.box_frac
+    box = (int(round(l * W)), int(round(t * H)),
+           int(round(r * W)), int(round(b * H)))
+    plan = CropPlan(size=(W, H), box=box, quad=_box_quad(box),
+                    conf=pred.conf, method="learned")
+    types = [t_ for _, _, t_ in _taught_samples(conn)]
+    plan.type = max(set(types), key=types.count) if types else None
+    if pred.conf < CONF_OK:
+        plan.warnings.append("low_confidence")
+    if box[0] <= 0 or box[1] <= 0 or box[2] >= W or box[3] >= H:
+        plan.warnings.append("touches_edge")
+    return plan
+
+
+def plan_crop(conn, img, deskew=None):
+    """Decide how to crop `img` (EXIF orientation already applied).
+    `conn` may be None (defaults, no taught examples)."""
+    W, H = img.size
+    side = min(W, H)
+    tolerance = get_param(conn, "crop_tolerance") if conn else \
+        DEFAULT_PARAMS["crop_tolerance"]
+    margin_pct = get_param(conn, "crop_margin_pct") if conn else \
+        DEFAULT_PARAMS["crop_margin_pct"]
+    if deskew is None:
+        deskew = bool(get_param(conn, "crop_deskew") if conn
+                      else DEFAULT_PARAMS["crop_deskew"])
+
+    # 1) A model trained on the user's own examples beats any generic rule.
+    model = get_model(conn) if conn is not None else None
+    learned = None
+    if model is not None:
+        learned = _learned_plan(conn, img, model)
+        if learned.conf >= LEARNED_OK:
+            return learned
+
+    det = doc_crop.detect_document(img, tolerance)
+    plan = CropPlan(size=(W, H), warnings=list(det.warnings),
+                    conf=det.conf, angle=det.angle, bg=det.bg,
+                    detect_quad=None if not det.found
+                    else [[float(x), float(y)] for x, y in det.quad])
+    if learned is not None and det.conf < CONF_OK:
+        return learned      # a weak generic guess never beats the model
+
+    prior = taught_prior(conn, W, H)
+
+    use_prior = None
+    if prior and prior["strong"]:
+        use_prior = "taught"
+        if det.found and det.conf >= 0.75:
+            db = doc_crop.quad_bounds(det.quad, W, H)
+            if _iou(prior["box"], db) < 0.7:
+                use_prior = None
+                plan.warnings.append("prior_disagree")
+    elif prior and (not det.found or det.conf < CONF_MIN):
+        use_prior = "prior"
+
+    if use_prior:
+        plan.box = tuple(prior["box"])
+        plan.quad = _box_quad(plan.box)
+        plan.method = use_prior
+        plan.type = prior["type"]
+        plan.deskew = False
+        if use_prior == "taught":
+            plan.conf = 0.9
+            plan.warnings = [w for w in plan.warnings
+                             if w not in ("low_confidence", "nothing_found")]
+        else:
+            plan.conf = 0.45
+            plan.warnings = [w for w in plan.warnings
+                             if w != "nothing_found"] + ["weak_prior"]
+        return plan
+
+    if not det.found or det.conf < CONF_MIN:
+        if learned is not None:
+            return learned
+        plan.reason = WARNING_LABELS.get(
+            "nothing_found" if not det.found else "low_confidence")
+        return plan
+
+    offsets = learned_offsets(conn)
+    if offsets:
+        margins = [o * side for o in offsets]
+        plan.method = "calibrated"
+    else:
+        margins = [margin_pct / 100.0 * side] * 4
+        plan.method = "auto"
+
+    if deskew and abs(det.angle) >= 0.7 and "full_frame" not in plan.warnings:
+        q = _fit_inside(det.quad, W, H, margins, side)
+        plan.quad = [[float(x), float(y)] for x, y in q]
+        plan.deskew = True
+        plan.box = doc_crop.quad_bounds(q, W, H)
+    else:
+        l, t, r, b = doc_crop.quad_bounds(det.quad, W, H)
+        l = int(max(0, l - margins[0]))
+        t = int(max(0, t - margins[1]))
+        r = int(min(W, r + margins[2]))
+        b = int(min(H, b + margins[3]))
+        if r - l < 8 or b - t < 8:
+            plan.reason = WARNING_LABELS["low_confidence"]
+            return plan
+        plan.box = (l, t, r, b)
+        plan.quad = _box_quad(plan.box)
+        plan.deskew = False
+    return plan
+
+
+def apply_plan(img, plan):
+    """The cropped image described by `plan`."""
+    if plan.deskew:
+        return doc_crop.warp_quad(img, plan.quad, plan.bg)
+    return img.crop(plan.box)
+
+
+def before_after_image(img, plan, max_h=360):
+    crop = apply_plan(img, plan)
+    return doc_crop.before_after_sheet(
+        img, plan.detect_quad if plan.deskew or plan.method in
+        ("auto", "calibrated") else plan.quad, crop,
+        ok=not plan.needs_review, max_h=max_h)
+
+
+def _save_cropped(img, plan, destination):
+    """Write the crop. `plan` is a CropPlan or a plain (l,t,r,b) box."""
+    cropped = apply_plan(img, plan) if isinstance(plan, CropPlan) \
+        else img.crop(plan)
+    kwargs = {}
+    if destination.suffix.lower() in (".jpg", ".jpeg"):
+        cropped = cropped.convert("RGB")
+        kwargs["quality"] = 95
+    try:
+        # the pixels are already rotated upright — keep the metadata but
+        # drop the Orientation tag so viewers do not rotate it twice
+        exif = img.getexif()
+        if exif:
+            exif.pop(0x0112, None)
+            kwargs["exif"] = exif
+    except Exception:
+        pass
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        cropped.save(destination, **kwargs)
+    except Exception:
+        kwargs.pop("exif", None)
+        cropped.save(destination, **kwargs)
+
+
+def save_crop_example(conn, source_path, img, type_, box, low_quality=False):
+    """Remember a box the user drew. Stored as fractions of the photo plus
+    what the detector found for that photo, so the *difference* can be
+    learned and re-applied to photos of any size."""
+    if hasattr(img, "size"):
+        w, h = img.size
+        det = doc_crop.detect_document(img, get_param(conn, "crop_tolerance"))
+        if det.found:
+            dl, dt, dr, db = doc_crop.quad_bounds(det.quad, w, h)
+            det_vals = (dl / w, dt / h, dr / w, db / h, det.conf)
+        else:
+            det_vals = (None, None, None, None, None)
+    else:
+        w, h = img
+        det_vals = (None, None, None, None, None)
+    left, top, right, bottom = box
+    conn.execute(
+        "INSERT INTO crop_examples (ts, source_path, img_w, img_h, type, "
+        "box_l, box_t, box_r, box_b, low_quality, det_l, det_t, det_r, "
+        "det_b, det_conf) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (datetime.now().isoformat(timespec="seconds"), str(source_path),
+         w, h, type_, left / w, top / h, right / w, bottom / h,
+         1 if low_quality else 0, *det_vals))
+    conn.commit()
+
+
+def learned_crop(conn, img):
+    """Compatibility wrapper: (box, method, type) or (None, reason, None)."""
+    plan = plan_crop(conn, img)
+    if plan.box is None:
+        return None, plan.reason or "none", None
+    return plan.box, plan.method, plan.type
+
+
+def _log_crop(conn, run_id, path, destination, plan, status):
+    conn.execute(
+        "INSERT INTO operation_log (ts, run_id, op, source, destination, "
+        "detail, status) VALUES (?, ?, 'crop', ?, ?, ?, ?)",
+        (datetime.now().isoformat(timespec="seconds"), run_id, str(path),
+         str(destination), plan.detail_json(), status))
+
+
+def _write_review_report(items, out_root):
+    """HTML page with a before/after picture per image (worst first), so a
+    whole batch can be verified at a glance."""
+    import html
+    review = Path(out_root) / "_review"
+    review.mkdir(parents=True, exist_ok=True)
+    items = sorted(items, key=lambda it: (not it["review"], it["conf"]))
+    cards = []
+    for i, it in enumerate(items):
+        name = f"{i:04d}.jpg"
+        it["sheet"].save(review / name, quality=88)
+        warns = "، ".join(WARNING_LABELS.get(w, w) for w in it["warnings"])
+        cls = "warn" if it["review"] else "ok"
+        cards.append(
+            f'<div class="card {cls}"><img src="{name}">'
+            f'<div class="meta"><b>{html.escape(it["name"])}</b><br>'
+            f'{it["src"][0]}×{it["src"][1]} ← → {it["out"][0]}×{it["out"][1]}'
+            f' &nbsp;|&nbsp; الثقة {it["conf"] * 100:.0f}%'
+            f'{"<br>⚠ " + html.escape(warns) if warns else ""}</div></div>')
+    page = ('<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8">'
+            '<title>مراجعة القص</title><style>'
+            'body{font-family:system-ui,sans-serif;background:#12151b;'
+            'color:#e8ecf2;margin:20px}'
+            '.grid{display:grid;grid-template-columns:repeat(auto-fill,'
+            'minmax(520px,1fr));gap:14px}'
+            '.card{background:#1b2029;border-radius:10px;padding:10px;'
+            'border:2px solid #2c3340}.card.warn{border-color:#f5aa32}'
+            '.card.ok{border-color:#2c6e49}img{max-width:100%;border-radius:6px}'
+            '.meta{font-size:13px;margin-top:6px;direction:ltr;text-align:left}'
+            '</style><h2>مراجعة القص — اليسار: قبل (الإطار = حدود القص) · '
+            'اليمين: بعد</h2><p>الإطار البرتقالي = يحتاج مراجعتك، '
+            'الأخضر = موثوق.</p><div class="grid">' + "".join(cards)
+            + "</div></html>")
+    path = review / "index.html"
+    path.write_text(page, encoding="utf-8")
+    return path
 
 
 def auto_crop_images():
     """Menu action: trim the background around every document photo. The
-    originals are never touched — results go to the auto_cropped folder."""
+    originals are never touched — results go to the auto_cropped folder,
+    with an HTML before/after report to verify them."""
     print("Cuts the background off document photos and saves the result in")
     print(f"'{tk.CROPPED_OUTPUT_DIR}' — original files are never modified.\n")
 
@@ -530,6 +1032,11 @@ def auto_crop_images():
         print("  [Cancelled]\n")
         return
     recursive = answer.strip().lower() not in ("n", "no")
+    answer = tk.ask("Straighten tilted papers too? (y/N): ")
+    if answer is None:
+        print("  [Cancelled]\n")
+        return
+    deskew = answer.strip().lower() in ("y", "yes")
 
     files = collect_image_files(tk.TARGET_DIR, recursive=recursive)
     if not files:
@@ -538,61 +1045,69 @@ def auto_crop_images():
 
     conn = _open_db()
     try:
-        margin = get_param(conn, "crop_margin")
-        tolerance = get_param(conn, "crop_tolerance")
         min_gain = get_param(conn, "crop_min_gain")
-        print(f"Using learned settings: margin {margin}px, "
-              f"tolerance {tolerance}, min gain {min_gain}%.\n")
+        print(f"Using learned settings: margin "
+              f"{get_param(conn, 'crop_margin_pct')}% of the photo, "
+              f"min gain {min_gain}%.\n")
 
         out_root = Path(tk.CROPPED_OUTPUT_DIR)
         run_id = _new_run_id()
         cropped = skipped = failed = 0
+        items = []
         for path in files:
             try:
                 rel = path.relative_to(tk.TARGET_DIR)
             except ValueError:
                 rel = Path(path.name)
-            destination = tk.unique_destination(out_root / rel.parent,
-                                                rel.name)
             try:
                 with Image.open(path) as img:
                     img = ImageOps.exif_transpose(img)
-                    box, reason = compute_crop(img, margin, tolerance)
-                    if box is None:
-                        print(f"  [Skipped] {rel}: {reason}")
+                    plan = plan_crop(conn, img, deskew=deskew)
+                    if plan.box is None:
+                        print(f"  [Skipped] {rel}: {plan.reason}")
                         skipped += 1
                         continue
-                    left, top, right, bottom = box
-                    old_area = img.width * img.height
-                    new_area = (right - left) * (bottom - top)
-                    gain = (old_area - new_area) / old_area * 100
-                    if gain < min_gain:
+                    if plan.gain < min_gain:
                         print(f"  [Skipped] {rel}: already tight "
-                              f"(cropping would free only {gain:.1f}%)")
+                              f"(cropping would free only {plan.gain:.1f}%)")
                         skipped += 1
                         continue
-
-                    _save_cropped(img, box, destination)
-                    conn.execute(
-                        "INSERT INTO operation_log "
-                        "(ts, run_id, op, source, destination, "
-                        " detail, status) "
-                        "VALUES (?, ?, 'crop', ?, ?, ?, 'approved')",
-                        (datetime.now().isoformat(timespec="seconds"),
-                         run_id, str(path), str(destination),
-                         f"margin {margin}, tolerance {tolerance}"))
+                    destination = tk.unique_destination(out_root / rel.parent,
+                                                        rel.name)
+                    _save_cropped(img, plan, destination)
+                    _log_crop(conn, run_id, path, destination, plan,
+                              "approved")
+                    out = plan.out_size
+                    flag = "  <-- CHECK" if plan.needs_review else ""
                     print(f"  {rel}: {img.width}x{img.height} -> "
-                          f"{right - left}x{bottom - top} "
-                          f"(freed {gain:.0f}%)")
+                          f"{out[0]}x{out[1]} (freed {plan.gain:.0f}%, "
+                          f"confidence {plan.conf * 100:.0f}%){flag}")
+                    items.append({
+                        "name": str(rel), "src": plan.size, "out": out,
+                        "conf": plan.conf, "warnings": plan.warnings,
+                        "review": plan.needs_review,
+                        "sheet": before_after_image(img, plan)})
                     cropped += 1
             except Exception as e:
                 print(f"  [Error] Failed to crop {rel}: {e}")
                 failed += 1
 
         conn.commit()
+        flagged = sum(1 for it in items if it["review"])
         print(f"\nDone! {cropped} image(s) cropped, {skipped} skipped, "
               f"{failed} failed. Results are in '{tk.CROPPED_OUTPUT_DIR}' "
               f"(batch {run_id}).")
+        if items:
+            report = _write_review_report(items, out_root)
+            print(f"Before/after report: {report}")
+            if flagged:
+                print(f"  {flagged} image(s) are marked CHECK — they appear "
+                      f"first in the report.")
+            try:
+                import webbrowser
+                webbrowser.open(report.resolve().as_uri())
+            except Exception:
+                pass
         print("Review them, then use the crop feedback option to teach the")
         print("cropper what 'good' looks like — or option 12 to undo the")
         print("whole batch.\n")
@@ -600,105 +1115,18 @@ def auto_crop_images():
         conn.close()
 
 
-def _save_cropped(img, box, destination):
-    """Write the cropped region of `img` to `destination` (keeping format
-    and EXIF where possible)."""
-    cropped = img.crop(box)
-    save_kwargs = {}
-    if destination.suffix.lower() in (".jpg", ".jpeg"):
-        save_kwargs = {"quality": 95}
-        if "exif" in img.info:
-            save_kwargs["exif"] = img.info["exif"]
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    cropped.save(destination, **save_kwargs)
-    return cropped
-
-
-def save_crop_example(conn, source_path, img_size, type_, box,
-                      low_quality=False):
-    """Store a user-taught crop as a normalized example the autonomous mode
-    can apply to other images of the same dimensions."""
-    width, height = img_size
-    left, top, right, bottom = box
-    conn.execute(
-        "INSERT INTO crop_examples (ts, source_path, img_w, img_h, type, "
-        "box_l, box_t, box_r, box_b, low_quality) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (datetime.now().isoformat(timespec="seconds"), str(source_path),
-         width, height, type_, left / width, top / height,
-         right / width, bottom / height, int(bool(low_quality))))
-    conn.commit()
-
-
-def learned_crop(conn, img):
-    """Crop box from what the toolkit was taught, falling back to
-    auto-detection. Returns (box or None, method, predicted_type) where
-    method is 'taught' or 'auto'.
-
-    Taught boxes are normalized, so examples can be reused across different
-    resolutions. Prefer examples with a similar aspect ratio and use a
-    median box so one imprecise example cannot shift the crop for every image.
-    Low-quality examples are excluded. When no relevant example exists,
-    fall back to per-image detection."""
-    width, height = img.size
-    aspect = width / height
-    examples = conn.execute(
-        "SELECT type, img_w, img_h, box_l, box_t, box_r, box_b "
-        "FROM crop_examples WHERE low_quality = 0").fetchall()
-    ranked = []
-    for row in examples:
-        type_, ex_w, ex_h, *coords = row
-        ex_aspect = ex_w / ex_h
-        distance = abs(math.log(aspect / ex_aspect))
-        # Reuse examples across resolutions and modest framing differences,
-        # but avoid applying a portrait crop to a landscape photo (or vice versa).
-        if distance <= 0.20:
-            ranked.append((distance, type_, coords))
-    if ranked:
-        ranked.sort(key=lambda item: item[0])
-        nearest = ranked[:5]
-        type_distances = defaultdict(list)
-        for distance, type_, _ in nearest:
-            type_distances[type_].append(distance)
-        type_ = min(type_distances, key=lambda kind: (
-            -len(type_distances[kind]),
-            sum(type_distances[kind]) / len(type_distances[kind]), kind))
-        selected = [coords for _, item_type, coords in nearest
-                    if item_type == type_]
-        normalized = [float(np.median([coords[i] for coords in selected]))
-                      for i in range(4)]
-        nl, nt, nr, nb = normalized
-        left = max(0, min(width - 1, round(nl * width)))
-        top = max(0, min(height - 1, round(nt * height)))
-        right = max(left + 1, min(width, round(nr * width)))
-        bottom = max(top + 1, min(height, round(nb * height)))
-        return (left, top, right, bottom), "taught", type_
-
-    margin = get_param(conn, "crop_margin")
-    tolerance = get_param(conn, "crop_tolerance")
-    arr = np.asarray(img.convert("RGB"), dtype=np.int16)
-    bbox = _content_bbox(arr, tolerance)
-    if bbox is None:
-        return None, "auto", None
-    left, top, right, bottom = bbox
-    left = max(0, left - margin)
-    top = max(0, top - margin)
-    right = min(width, right + margin)
-    bottom = min(height, bottom + margin)
-    return (left, top, right, bottom), "auto", None
-
-
-def run_autonomous_crop():
-    """Work mode: crop every image using the learned model and record each
-    copy as a pending operation awaiting user approval. Returns
-    (run_id, created, skipped)."""
+def run_autonomous_crop(deskew=None):
+    """Crop every image in the working folder with the learned/detected
+    plan. Results are `pending` until the user approves them (with a
+    before/after view in the GUI). Returns (run_id, created, skipped)."""
+    files = collect_image_files(tk.TARGET_DIR, recursive=True)
     conn = _open_db()
     try:
-        files = collect_image_files(tk.TARGET_DIR)
         out_root = Path(tk.CROPPED_OUTPUT_DIR)
-        run_id = _new_run_id()
         min_gain = get_param(conn, "crop_min_gain")
-        created = skipped = 0
+        run_id = _new_run_id()
+        created = 0
+        skipped = []
         for path in files:
             try:
                 rel = path.relative_to(tk.TARGET_DIR)
@@ -707,33 +1135,22 @@ def run_autonomous_crop():
             try:
                 with Image.open(path) as img:
                     img = ImageOps.exif_transpose(img)
-                    box, method, type_ = learned_crop(conn, img)
-                    if box is None:
-                        print(f"  [Skipped] {rel}: nothing to crop")
-                        skipped += 1
+                    plan = plan_crop(conn, img, deskew=deskew)
+                    if plan.box is None:
+                        skipped.append((str(rel), plan.reason))
                         continue
-                    left, top, right, bottom = box
-                    old_area = img.width * img.height
-                    gain = (old_area - (right - left) * (bottom - top)) \
-                        / old_area * 100
-                    if gain < min_gain:
-                        skipped += 1
+                    if plan.gain < min_gain:
+                        skipped.append((str(rel), "لا حاجة للقص "
+                                        f"(يوفّر {plan.gain:.1f}% فقط)"))
                         continue
                     destination = tk.unique_destination(
                         out_root / rel.parent, rel.name)
-                    _save_cropped(img, box, destination)
-                    conn.execute(
-                        "INSERT INTO operation_log "
-                        "(ts, run_id, op, source, destination, detail, "
-                        " status) VALUES (?, ?, 'crop', ?, ?, ?, 'pending')",
-                        (datetime.now().isoformat(timespec="seconds"),
-                         run_id, str(path), str(destination),
-                         f"method={method}, type={type_ or 'unknown'}"))
-                    print(f"  [Pending approval] {rel} "
-                          f"({method}, {TYPE_LABELS.get(type_, type_)})")
+                    _save_cropped(img, plan, destination)
+                    _log_crop(conn, run_id, path, destination, plan,
+                              "pending")
                     created += 1
             except Exception as e:
-                print(f"  [Error] {rel}: {e}")
+                skipped.append((str(rel), f"خطأ: {e}"))
         conn.commit()
         return run_id, created, skipped
     finally:
@@ -751,17 +1168,26 @@ def review_operations(conn, approve_ids, reject_ids):
     """Approve or reject pending operations; rejecting a crop deletes the
     generated copy. Returns the number of rejected copies removed."""
     removed = 0
+    now = datetime.now().isoformat(timespec="seconds")
     for op_id in reject_ids:
         row = conn.execute(
-            "SELECT op, destination FROM operation_log WHERE id = ?",
-            (op_id,)).fetchone()
-        if row is not None and row[0] == "crop" \
-                and row[1] and os.path.exists(row[1]):
-            os.remove(row[1])
-            removed += 1
+            "SELECT op, destination, detail FROM operation_log "
+            "WHERE id = ?", (op_id,)).fetchone()
+        if row is not None and row[0] == "crop":
+            if row[1] and os.path.exists(row[1]):
+                os.remove(row[1])
+                removed += 1
+            conn.execute("INSERT INTO feedback_log (ts, kind, detail) "
+                         "VALUES (?, 'crop_rejected', ?)", (now, row[2]))
         conn.execute("UPDATE operation_log SET status = 'rejected' "
                      "WHERE id = ?", (op_id,))
     for op_id in approve_ids:
+        row = conn.execute(
+            "SELECT op, detail FROM operation_log WHERE id = ?",
+            (op_id,)).fetchone()
+        if row is not None and row[0] == "crop":
+            conn.execute("INSERT INTO feedback_log (ts, kind, detail) "
+                         "VALUES (?, 'crop_approved', ?)", (now, row[1]))
         conn.execute("UPDATE operation_log SET status = 'approved' "
                      "WHERE id = ?", (op_id,))
     conn.commit()
@@ -784,25 +1210,15 @@ def crop_feedback():
     conn = _open_db()
     try:
         if answer == "1":
-            # Keep more padding and let dimmer pixels (shadows, page edges)
-            # count as content.
-            margin = _clamp("crop_margin",
-                            get_param(conn, "crop_margin") + 4)
-            tolerance = _clamp("crop_tolerance",
-                               get_param(conn, "crop_tolerance") - 4)
-            set_param(conn, "crop_margin", margin, "crop_too_tight",
-                      "crops were cutting off content")
-            set_param(conn, "crop_tolerance", tolerance, "crop_too_tight",
-                      "crops were cutting off content")
+            margin = _clamp("crop_margin_pct",
+                            get_param(conn, "crop_margin_pct") + 0.5)
+            set_param(conn, "crop_margin_pct", round(margin, 2),
+                      "crop_too_tight", "crops were cutting off content")
         elif answer == "2":
-            margin = _clamp("crop_margin",
-                            get_param(conn, "crop_margin") - 4)
-            tolerance = _clamp("crop_tolerance",
-                               get_param(conn, "crop_tolerance") + 4)
-            set_param(conn, "crop_margin", margin, "crop_too_loose",
-                      "crops left background in")
-            set_param(conn, "crop_tolerance", tolerance, "crop_too_loose",
-                      "crops left background in")
+            margin = _clamp("crop_margin_pct",
+                            get_param(conn, "crop_margin_pct") - 0.5)
+            set_param(conn, "crop_margin_pct", round(margin, 2),
+                      "crop_too_loose", "crops left background in")
         elif answer == "3":
             conn.execute(
                 "INSERT INTO feedback_log (ts, kind, detail) "
@@ -900,6 +1316,17 @@ def learning_status():
             marker = "" if value != default else " *"
             bounds = PARAM_BOUNDS[key]
             print(f"  {key:<22} {value}{marker}   (allowed {bounds[0]}..{bounds[1]})")
+
+        n_ex = conn.execute("SELECT COUNT(*) FROM crop_examples").fetchone()[0]
+        offs = learned_offsets(conn)
+        print(f"\nTaught crop examples: {n_ex}")
+        if offs:
+            print("  Learned margin around the paper (% of short side): "
+                  f"left {offs[0]*100:.1f}, top {offs[1]*100:.1f}, "
+                  f"right {offs[2]*100:.1f}, bottom {offs[3]*100:.1f}")
+        else:
+            print("  (needs 2+ examples with a confident detection to "
+                  "learn the margin)")
 
         counts = conn.execute(
             "SELECT kind, COUNT(*) FROM feedback_log GROUP BY kind "

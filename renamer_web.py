@@ -78,6 +78,8 @@ def _config():
     cfg.setdefault("re_find", "")
     cfg.setdefault("re_repl", "")
     cfg.setdefault("re_icase", False)
+    cfg.setdefault("dark", True)            # a fresh config used to crash /api/config
+    cfg.setdefault("last_kind", "income")
     return cfg
 
 
@@ -265,7 +267,7 @@ class Handler(BaseHTTPRequestHandler):
             cfg = _config()
             self._json(200, {k: cfg[k] for k in
                              ("templates", "last_template", "re_find",
-                              "re_repl", "re_icase", "dark")})
+                              "re_repl", "re_icase", "dark", "last_kind")})
         elif route == "/api/home":
             self._json(200, {"home": str(ftk.TARGET_DIR)})
         elif route == "/api/subdirs":
@@ -404,7 +406,7 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/config":
             cfg = _config()
             for key in ("templates", "last_template", "re_find", "re_repl",
-                        "re_icase", "dark"):
+                        "re_icase", "dark", "last_kind"):
                 if key in data:
                     cfg[key] = data[key]
             _save_config(cfg)
@@ -465,13 +467,18 @@ class Handler(BaseHTTPRequestHandler):
             err = exif_err or err
             if exif_err:
                 new = None
+            kind_n = None
+            if new and not err:
+                new, kind_n = qr.apply_kind(
+                    new, path, data.get("kind") or qr.KIND_INCOME,
+                    tpl=data.get("tpl", ""))
             conn = it._open_db()
             try:
                 dup = _find_duplicate(conn, path) if not err else None
             finally:
                 conn.close()
             self._json(200, {
-                "new": new, "err": err,
+                "new": new, "err": err, "invoice_n": kind_n,
                 "same": new == path or (new is None and err is None),
                 "conflict": bool(new) and qr.conflicts(new, path),
                 "dup": {"path": dup[0],
@@ -536,6 +543,9 @@ class Handler(BaseHTTPRequestHandler):
             files = _list_files(SESSION["folder"], SESSION.get("sub", False))
             rows = []
             counter = int(data.get("counter") or 1)
+            kind = data.get("kind") or qr.KIND_INCOME
+            taken = set()          # invoice stems handed out in this batch
+            seen_new = set()       # every new name planned so far
             for path in files:
                 tpl, exif_err = _expand_exif_token(path, data.get("tpl", ""))
                 new, err = qr.make_plan(
@@ -549,12 +559,22 @@ class Handler(BaseHTTPRequestHandler):
                 uses_n = any((m.group("tok") or "").lower() == "n"
                              for m in qr.TPL_RE.finditer(data.get("tpl", "")))
                 if err is None and new is not None and new != path:
+                    new, _n = qr.apply_kind(new, path, kind,
+                                            tpl=data.get("tpl", ""),
+                                            taken=taken)
+                    taken.add(os.path.splitext(os.path.basename(new))[0].lower())
                     counter += 1
+                # two files of this batch must not get the same name
+                dup_in_batch = bool(new) and new != path \
+                    and os.path.normcase(new) in seen_new
+                if new and new != path:
+                    seen_new.add(os.path.normcase(new))
                 rows.append({
                     "path": path, "name": os.path.basename(path),
                     "new": new, "err": err,
                     "same": new == path or (new is None and err is None),
-                    "conflict": bool(new) and qr.conflicts(new, path),
+                    "conflict": bool(new) and (qr.conflicts(new, path)
+                                               or dup_in_batch),
                 })
             self._json(200, {"rows": rows, "n": len(rows)})
         elif route == "/api/batch_commit":
@@ -738,6 +758,11 @@ body.light .preview-wrap { background:#dfe4ec; }
 .pager button { background:var(--surface2); color:var(--text); border:1px solid var(--border);
   border-radius:99px; padding:5px 14px; cursor:pointer; font:inherit; font-size:13px; }
 .pager button:disabled { opacity:.4; cursor:default; }
+.seg { display:flex; gap:0; border:1px solid var(--border); border-radius:10px; overflow:hidden; }
+.seg button { flex:1; background:var(--surface2); color:var(--text); border:0; padding:9px 8px;
+  font:inherit; font-size:13.5px; cursor:pointer; }
+.seg button + button { border-right:1px solid var(--border); }
+.seg button.sel { background:var(--accent); color:#fff; font-weight:800; }
 label.fld { display:block; font-size:12px; color:var(--muted); margin:8px 0 4px; }
 input[type=text], input[type=number], select {
   width:100%; background:var(--field); color:var(--text);
@@ -840,6 +865,12 @@ table.help td { padding:6px 8px; border-bottom:1px solid var(--border); font-siz
 
     <div id="controls-col">
       <div class="card">
+        <label class="fld">نوع الملف <span class="muted">(Alt+1 / Alt+2)</span></label>
+        <div class="seg" id="kind-seg">
+          <button type="button" data-kind="income" class="sel" onclick="setKind('income')">📄 ورقة الدخل</button>
+          <button type="button" data-kind="invoice" onclick="setKind('invoice')">🧾 فاتورة (‎-1، ‎-2 …)</button>
+        </div>
+        <div id="kind-hint" class="muted" style="font-size:12px; margin-top:4px;"></div>
         <label class="fld">الاسم الجديد — اكتب النص مكان xx</label>
         <input type="text" id="typed" placeholder="اكتب هنا… (Enter فارغ = تخطي)">
         <div id="preview-line"></div>
@@ -964,6 +995,7 @@ table.help td { padding:6px 8px; border-bottom:1px solid var(--border); font-siz
       <tr><td class="ltr">{n} / {n:03}</td><td>العدّاد التلقائي — :03 يعني ثلاث خانات (001)</td></tr>
       <tr><td class="ltr">{date}</td><td>تاريخ اليوم — بتنسيق مثل {date:%m-%Y}</td></tr>
       <tr><td class="ltr">{mtime}</td><td>تاريخ آخر تعديل للملف — مثل {mtime:%d-%m-%Y}</td></tr>
+      <tr><td>نوع الملف</td><td><b>ورقة الدخل</b>: ملف واحد لكل تاريخ بالاسم العادي. <b>فاتورة</b>: يُضاف <span class="ltr">-n</span> في آخر الاسم؛ n يبدأ من 1 لكل تاريخ جديد ويكمل العدّ إذا وُجد التاريخ مسبقاً في المجلد.</td></tr>
       <tr><td class="ltr">{exif_date}</td><td>تاريخ التصوير من EXIF (وليس تاريخ التعديل) — مثل {exif_date:%d-%m-%Y}. مثالي لصور الواتساب</td></tr>
     </table>
     <div class="muted" style="margin-top:10px; line-height:1.9;">
@@ -980,7 +1012,7 @@ table.help td { padding:6px 8px; border-bottom:1px solid var(--border); font-siz
 window.onerror = (msg, src, line) => { const s = document.getElementById('status');
   if (s) s.textContent = 'JS ERROR: ' + msg + ' @' + line; };
 const $ = id => document.getElementById(id);
-let FILES = [], IDX = 0, PAGES = 1, PAGE = 0, META = null, META_KEYS = [],
+let KIND = 'income', FILES = [], IDX = 0, PAGES = 1, PAGE = 0, META = null, META_KEYS = [],
     META_VALUES = {}, TEMPLATES = [], PENDING_PLAN = null, EXT_PINNED = null;
 
 function toast(msg) {
@@ -1164,8 +1196,17 @@ async function applyMetaBatch() {
 }
 
 /* ---------- planning / live preview ---------- */
+function setKind(k, silent) {
+  KIND = k;
+  for (const b of document.querySelectorAll('#kind-seg button'))
+    b.classList.toggle('sel', b.dataset.kind === k);
+  $('kind-hint').textContent = k === 'invoice'
+    ? 'الفاتورة: يُضاف -n تلقائياً (يبدأ من 1 لكل تاريخ ويكمل إن وُجد التاريخ)'
+    : 'ورقة الدخل: ملف واحد لكل تاريخ — بدون رقم';
+  if (!silent) { api('/api/config', { last_kind: k }); refreshPreview(); }
+}
 function planInput() {
-  return { path: FILES[IDX]?.path, typed: $('typed').value,
+  return { kind: KIND, path: FILES[IDX]?.path, typed: $('typed').value,
     tpl: $('tpl').value, ext: $('ext').value || null,
     find: $('re-find').value, repl: $('re-repl').value,
     icase: $('re-icase').checked, counter: parseInt($('counter').value || '1') };
@@ -1231,10 +1272,12 @@ async function commit(f, new_name, overwrite, keep_both) {
     toast(d.msgs.join(' • ') || 'لا تغيير');
     f.path = d.path; f.name = d.path.split('/').pop();
     RENAMED.add(f.name);
+    $('typed').value = '';                 // clear for the next file
     if ($('tpl').value && /{n(?::[^}]*)?}/i.test($('tpl').value))
       $('counter').value = (parseInt($('counter').value || '1')) + 1;
     if (IDX + 1 < FILES.length) load(IDX + 1);
     else { toast('انتهت قائمة الملفات ✓'); $('preview-line').textContent = ''; }
+    $('typed').focus();
   } catch (e) { toast('خطأ: ' + e.message); }
 }
 
@@ -1394,6 +1437,8 @@ window.addEventListener('keydown', e => {
     if (document.activeElement.id === 'folder') { openFolder(); e.preventDefault(); return; }
     saveNext(); e.preventDefault(); return;
   }
+  if (e.altKey && e.key === '1') { setKind('income'); e.preventDefault(); return; }
+  if (e.altKey && e.key === '2') { setKind('invoice'); e.preventDefault(); return; }
   if (e.ctrlKey && e.key.toLowerCase() === 'u') { doUndo(); e.preventDefault(); return; }
   if (e.altKey && e.key === 'ArrowLeft') { nav(1); e.preventDefault(); return; }
   if (e.altKey && e.key === 'ArrowRight') { nav(-1); e.preventDefault(); return; }
@@ -1418,6 +1463,7 @@ window.addEventListener('keydown', e => {
     $('re-find').value = cfg.re_find || '';
     $('re-repl').value = cfg.re_repl || '';
     $('re-icase').checked = !!cfg.re_icase;
+    setKind(cfg.last_kind || 'income', true);
     if (cfg.dark === false) { document.body.classList.add('light');
       $('theme-btn').textContent = '🌙 داكن'; }
     const home = await api('/api/home');

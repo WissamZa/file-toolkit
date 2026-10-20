@@ -146,6 +146,64 @@ def make_plan(path, typed, tpl, ext_raw=KEEP, find="", repl="", icase=False, cou
     return new_path, None
 
 
+# ----------------------------------------------------------------------------
+# File kind: income sheet (one per date) vs invoice (several per date)
+# ----------------------------------------------------------------------------
+KIND_INCOME = "income"
+KIND_INVOICE = "invoice"
+
+
+def invoice_path(new_path, own_path, taken=None):
+    """Turn ``15-09-2026.jpg`` into ``15-09-2026-<n>.jpg`` for an invoice.
+
+    n continues from whatever already exists in the folder for that date
+    (highest suffix + 1, so gaps can never cause a collision) and starts at
+    1 for a date that has no invoices yet — i.e. it restarts for every new
+    date automatically. ``taken`` is an optional set of lower-case stems that
+    are about to be used (batch planning). Returns (path, n); n is None when
+    the name was left untouched.
+    """
+    folder = os.path.dirname(new_path)
+    base, ext = os.path.splitext(os.path.basename(new_path))
+    own_stem = os.path.splitext(os.path.basename(own_path))[0]
+    # only the extension changed (nothing typed): never add a suffix
+    if base.lower() == own_stem.lower():
+        return new_path, None
+    pat = re.compile(r"^" + re.escape(base) + r"-(\d+)$", re.IGNORECASE)
+    # this file is already invoice number k of that date: keep its number
+    own = pat.match(own_stem)
+    if own and os.path.normcase(os.path.dirname(own_path)) == os.path.normcase(folder):
+        return os.path.join(folder, own_stem + ext), int(own.group(1))
+    highest = 0
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        names = []
+    for name in names:
+        if os.path.normcase(os.path.join(folder, name)) == os.path.normcase(own_path):
+            continue
+        m = pat.match(os.path.splitext(name)[0])
+        if m:
+            highest = max(highest, int(m.group(1)))
+    for stem in (taken or ()):
+        m = pat.match(stem)
+        if m:
+            highest = max(highest, int(m.group(1)))
+    n = highest + 1
+    return os.path.join(folder, f"{base}-{n}{ext}"), n
+
+
+def apply_kind(new_path, own_path, kind, tpl="", taken=None):
+    """Apply the file kind to a planned path. Income sheets keep the plain
+    name; invoices get ``-n``. A template that already uses {n} is left alone
+    (the user is numbering explicitly)."""
+    if not new_path or kind != KIND_INVOICE:
+        return new_path, None
+    if any((m.group("tok") or "").lower() == "n" for m in TPL_RE.finditer(tpl or "")):
+        return new_path, None
+    return invoice_path(new_path, own_path, taken)
+
+
 def conflicts(new_path, path):
     """True if new_path is a *different* existing file (case-only renames are not conflicts)."""
     try:
@@ -459,6 +517,13 @@ class RenamerApp:
         self.cur_name = ttk.Label(right, text="—", style="CurName.TLabel", wraplength=380, justify="left")
         self.cur_name.pack(anchor="w", fill="x", pady=(0, 4))
 
+        self.kind_var = tk.StringVar(value=self.cfg.get("last_kind", KIND_INCOME))
+        kf = ttk.Frame(right)
+        kf.pack(fill="x", pady=(0, 4))
+        ttk.Radiobutton(kf, text="Income sheet (Alt+1)", value=KIND_INCOME,
+                        variable=self.kind_var).pack(side="left")
+        ttk.Radiobutton(kf, text="Invoice  -n (Alt+2)", value=KIND_INVOICE,
+                        variable=self.kind_var).pack(side="left", padx=(12, 0))
         self.name_var = tk.StringVar()
         self.name_entry = ttk.Entry(right, textvariable=self.name_var, font=("Segoe UI", 12))
         self.name_entry.pack(fill="x")
@@ -542,7 +607,7 @@ class RenamerApp:
 
         # live preview whenever anything that affects the name changes
         for var in (self.name_var, self.tpl_var, self.re_find, self.re_repl,
-                    self.re_icase, self.ext_var, self.counter_var):
+                    self.re_icase, self.ext_var, self.counter_var, self.kind_var):
             var.trace_add("write", lambda *a: self.refresh_preview())
 
         self.apply_theme()
@@ -551,6 +616,8 @@ class RenamerApp:
     def _bind_keys(self):
         r = self.root
         self.name_entry.bind("<Return>", lambda e: self.submit())
+        self.root.bind("<Alt-Key-1>", lambda e: self.kind_var.set(KIND_INCOME))
+        self.root.bind("<Alt-Key-2>", lambda e: self.kind_var.set(KIND_INVOICE))
         for w in self.field_widgets.values():
             w.bind("<Return>", lambda e: self.submit())
         for w in (self.tpl_combo, self.ext_combo, self.re_find_entry, self.re_repl_entry):
@@ -622,6 +689,7 @@ class RenamerApp:
             "re_repl": self.re_repl.get(),
             "re_icase": self.re_icase.get(),
             "dark": self.dark,
+            "last_kind": self.kind_var.get(),
         }
         try:
             CONFIG_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -987,9 +1055,12 @@ class RenamerApp:
             return 0
 
     def plan(self, path):
-        return make_plan(path, self.name_var.get(), self.tpl_var.get(), self.ext_var.get(),
-                         self.re_find.get(), self.re_repl.get(), self.re_icase.get(),
-                         self.counter_value())
+        new_path, err = make_plan(path, self.name_var.get(), self.tpl_var.get(),
+                                  self.ext_var.get(), self.re_find.get(), self.re_repl.get(),
+                                  self.re_icase.get(), self.counter_value())
+        if new_path and not err:
+            new_path, _n = apply_kind(new_path, path, self.kind_var.get(), self.tpl_var.get())
+        return new_path, err
 
     def refresh_preview(self):
         if not self.files:
